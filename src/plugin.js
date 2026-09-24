@@ -822,13 +822,14 @@ module.exports = class WordMemoPlugin extends Plugin {
         });
 
         this.addCommand({
-            id: 'open-word-memo',
+            // 命令 id 不含插件 id：Obsidian 会自动前缀成 word-memo:open-app
+            id: 'open-app',
             name: '打开词忆 Word Memo',
             callback: () => this.activateView()
         });
 
         this.addCommand({
-            id: 'open-word-memo-cover',
+            id: 'open-app-cover',
             name: '打开词忆封面视窗',
             callback: () => this.activateCoverView()
         });
