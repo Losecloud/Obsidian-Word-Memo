@@ -261,7 +261,7 @@ function extractAppBundle(vaultBase) {
         if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === stamp) return target;
     } catch (e) { /* 读取失败则重新解压 */ }
 
-    const raw = zlib.gunzipSync(Buffer.from(WM_APP_BUNDLE, 'base64'));
+    const raw = zlib.brotliDecompressSync(Buffer.from(WM_APP_BUNDLE, 'base64'));
     if (raw.slice(0, 4).toString('ascii') !== 'WMB1') throw new Error('内嵌应用包格式不正确');
 
     let off = 4;
