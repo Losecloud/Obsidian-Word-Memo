@@ -62,6 +62,7 @@ const DICT_DISPLAY_NAMES = { 'englishwords-dict.json': '基础词典' };
 // 更新 data/dict-manifest.js：只 upsert 本次导入的词典条目，保留其余条目原样。
 // 不用整表重扫，避免抹掉已有条目的 mdd 资源目录（如 oaldpe 的样式/发音）等字段
 // varNameHint：JSON 内容无法解析出变量名，由调用方（/save-dict 请求）显式提供
+// 返回 { count, mdd }：mdd 为同名资源目录名（样式/图片/真人发音），供 /save-dict 响应回传给前端
 function upsertDictManifest(dataDir, fname, content, varNameHint) {
     let varName = varNameHint || '';
     if (!varName) {
@@ -69,7 +70,7 @@ function upsertDictManifest(dataDir, fname, content, varNameHint) {
         if (mv) varName = mv[1];
     }
     if (!varName && /-dict\.json$/i.test(fname)) varName = dictVarNameFromFile(fname);
-    if (!varName) return 0;
+    if (!varName) return { count: 0, mdd: '' };
     const mf = path.join(dataDir, 'dict-manifest.js');
     let list = [];
     try {
@@ -77,18 +78,22 @@ function upsertDictManifest(dataDir, fname, content, varNameHint) {
         if (arr) list = JSON.parse(arr[0]);
     } catch (e) { /* 无清单或格式异常：从空表开始 */ }
     if (!Array.isArray(list)) list = [];
-    const name = DICT_DISPLAY_NAMES[fname] || fname.replace(/-dict\.(js|json)$/i, '');
+    // 资源目录按文件名主干探测，与显示名无关——若按 name（可能被 DICT_DISPLAY_NAMES 改写成中文）探测，
+    // 一旦词典配了显示名就找不到 data/<主干>/ 资源目录，样式会静默失效
+    const stem = fname.replace(/-dict\.(js|json)$/i, '');
+    const name = DICT_DISPLAY_NAMES[fname] || stem;
     const entry = { file: fname, name: name, varName: varName };
     if (/-dict\.json$/i.test(fname)) entry.format = 'json';
     // 同名资源目录存在则记录 mdd（词条 HTML 中的图片/音频/CSS 均相对该目录解析）
-    const dir = path.join(dataDir, name);
-    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) entry.mdd = name;
+    const dir = path.join(dataDir, stem);
+    const mdd = (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) ? stem : '';
+    if (mdd) entry.mdd = mdd;
     const i = list.findIndex((x) => x && x.file === fname);
     if (i >= 0) list[i] = Object.assign({}, list[i], entry);
     else list.push(entry);
     list.sort((a, b) => String(a.name).localeCompare(String(b.name)));
     fs.writeFileSync(mf, '// 自动生成：浏览器导入或 tools/convert-mdx.js 更新，请勿手改\nvar DICT_MANIFEST = ' + JSON.stringify(list, null, 1) + ';\n', 'utf8');
-    return list.length;
+    return { count: list.length, mdd: mdd };
 }
 
 // 从 data/dict-manifest.js 移除指定文件的条目（卸载词典时用），保留其余条目原样
@@ -300,7 +305,9 @@ function extractAppBundle(vaultBase) {
         const dataDir = path.join(target, 'data');
         fs.readdirSync(dataDir).forEach((f) => {
             if (!/-dict\.(js|json)$/i.test(f) || f === 'dict-manifest.js' || written.has('data/' + f)) return;
-            upsertDictManifest(dataDir, f, fs.readFileSync(path.join(dataDir, f), 'utf8'));
+            // .json 词典的变量名由文件名推导，无需读入整份内容（oaldpe 达 320MB，全量读入会明显拖慢启动）
+            const content = /-dict\.(js)$/i.test(f) ? fs.readFileSync(path.join(dataDir, f), 'utf8') : '';
+            upsertDictManifest(dataDir, f, content);
         });
     } catch (e) { /* 忽略：无 data 目录或读取失败 */ }
 
@@ -422,6 +429,41 @@ class StaticServer {
             res.end(JSON.stringify(obj));
         };
         if (req.method !== 'POST') { send(405, { ok: false, error: 'method not allowed' }); return; }
+        // raw=1&file=<fname>：已解析词典（.json / .js）原始字节直传（与 tools/serve.js 对齐）。
+        // 不做 JSON.parse、不构造文本，直接落盘并登记清单——超大词典（oaldpe 约 320MB）
+        // 若走 {content} 通道，浏览器要 stringify、宿主还要再 parse，内存会被撑爆。
+        const params = new URLSearchParams(String(req.url || '').split('?')[1] || '');
+        if (params.get('raw') === '1') {
+            // URLSearchParams 已完成一次解码，此处直接取用（再 decode 会把文件名里的 % 误解析）
+            const fname = params.get('file') || '';
+            const safeRaw = /^[^\\/:*?"<>|]+-dict\.(js|json)$/i.test(fname) && fname.charAt(0) !== '.' ? fname : '';
+            if (!safeRaw) { send(400, { ok: false, error: '文件名不合法' }); req.destroy(); return; }
+            const dataDir = path.join(this.root, 'data');
+            const chunks = [];
+            let size = 0;
+            req.on('data', (c) => {
+                size += c.length;
+                if (size > 512 * 1024 * 1024) { req.destroy(); return; }
+                chunks.push(c);
+            });
+            req.on('end', () => {
+                try {
+                    fs.mkdirSync(dataDir, { recursive: true });
+                    const fp = path.join(dataDir, safeRaw);
+                    fs.writeFileSync(fp, Buffer.concat(chunks));
+                    let varName = /-dict\.json$/i.test(safeRaw) ? dictVarNameFromFile(safeRaw) : '';
+                    if (!varName) {
+                        const mv = /var\s+([\p{L}_$][\p{L}\p{N}_$]*)\s*=\s*\{/u.exec(fs.readFileSync(fp, 'utf8').slice(0, 4096));
+                        varName = mv ? mv[1] : '';
+                    }
+                    const r = varName ? upsertDictManifest(dataDir, safeRaw, '', varName) : { count: 0, mdd: '' };
+                    send(200, { ok: true, file: safeRaw, count: r.count, varName: varName, mdd: r.mdd });
+                } catch (e) {
+                    send(500, { ok: false, error: e.message });
+                }
+            });
+            return;
+        }
         let body = '';
         req.on('data', (c) => { body += c; if (body.length > 512 * 1024 * 1024) req.destroy(); });
         req.on('end', () => {
@@ -435,8 +477,8 @@ class StaticServer {
                 const fname = safe || dictFileName(varName, /-dict\.json$/i.test(String(file || '')) ? 'json' : 'js');
                 fs.mkdirSync(dataDir, { recursive: true });
                 fs.writeFileSync(path.join(dataDir, fname), content, 'utf8');
-                const count = upsertDictManifest(dataDir, fname, content, varName);
-                send(200, { ok: true, file: fname, count: count });
+                const r = upsertDictManifest(dataDir, fname, content, varName);
+                send(200, { ok: true, file: fname, count: r.count, mdd: r.mdd });
             } catch (e) {
                 send(400, { ok: false, error: e.message });
             }
@@ -600,10 +642,12 @@ class FrameView extends ItemView {
             src = this.app.vault.adapter.getResourcePath(file.path);
         }
 
-        // 附加查询参数：视图模式 + 宿主主题（主题随参数带入，避免首屏闪烁）
+        // 附加查询参数：视图模式 + 宿主主题（主题随参数带入，避免首屏闪烁）+ 宿主标识
+        // （页面据此判断运行在 Obsidian 内，进而选用插件仓库的说明文档等宿主相关内容）
         const params = [];
         if (this.opts.query) params.push(this.opts.query);
         params.push('wmTheme=' + hostTheme());
+        params.push('wmHost=obsidian');
         return src + (src.indexOf('?') === -1 ? '?' : '&') + params.join('&');
     }
 
