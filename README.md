@@ -52,7 +52,7 @@
 
 > 两套自研封面——2D 力导向的仿生蒲公英，与 WebGL 流场粒子的 3D 星云
 
-**蒲公英聚类**把词按词义一级分类聚成花冠外圈，种子大小取 CEFR 词频，错误率 ≥ 50% 的重点难词自动标红；切换「忘记词」口径，待复习的词即从花头飘向空中——花头留下的是已掌握，飘着的就是要复习的，还可直接拖拽整理清单。
+**蒲公英聚类**把词按词义一级分类聚成花冠外圈，种子大小取 CEFR 词频，正确率 ≤ 50% 的重点难词自动标红；切换「忘记词」口径，待复习的词即从花头飘向空中——花头留下的是已掌握，飘着的就是要复习的，还可直接拖拽整理清单。
 **混沌星云**以无散度流场驱动上万粒子，点选任一词即以贝塞尔曲线连出最强关联（词根、形近可跨星团）并标注关系依据。难词由此不再是散点，而是一张有优先级、有联想路径的网。
 
 ![蒲公英聚类](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E8%92%B2%E5%85%AC%E8%8B%B1%E8%81%9A%E7%B1%BB.png)
@@ -170,6 +170,25 @@ python tools/web2ob.py                     # 打包应用内核（不内嵌任�
 ## 📄 许可
 
 [MIT](LICENSE)
+
+## English
+
+Word Memo is a permanently free vocabulary tool for Obsidian, deeply integrated with your notes: hover lookup · selection translate · hard-word visualization · spaced repetition review · AI workshop. The plugin UI is currently in Chinese; the full English documentation is in [README_EN.md](README_EN.md).
+
+### Installation
+
+**From Obsidian:** **Settings → Community plugins → Browse** → search `Word Memo` → **Install** → **Enable**.
+
+**Manually:** download `main.js`, `manifest.json` and `styles.css` from the latest release into `<your vault>/.obsidian/plugins/word-memo/`, then enable **Word Memo** under **Settings → Community plugins**.
+
+### Usage
+
+- **Hover lookup** — hover a word in a note or a text-based PDF and its definition appears in the right sidebar.
+- **Selection translate** — select a word for its dictionary entry, or a sentence for an AI translation (floating button or right-click menu).
+- **Sidebar panel** — a dedicated Word Memo panel docked in the right sidebar, powered by the built-in dictionary engine.
+- **Full app view** — open the complete app (word books, visual covers, review, AI workshop) in a tab.
+
+Hover lookup and selection translate can be turned off in **Settings → Word Memo**.
 
 ---
 

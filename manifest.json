@@ -1,7 +1,7 @@
 {
   "id": "word-memo",
   "name": "Word Memo",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "minAppVersion": "1.4.0",
   "description": "Look up words and translate selected text from notes and PDFs, backed by an in-app dictionary, force-directed dandelion clustering, a WebGL chaos nebula, spaced repetition review, and AI explanations.",
   "author": "词忆团队",

@@ -6,6 +6,12 @@
     overflow: hidden;
 }
 
+/* 隐藏宿主视图抬头（标题 + 前进后退 + ⋮ 菜单）：iframe 内已是完整的词忆应用
+   界面，该抬头形如浏览器工具栏，重复且白占高度，故整块移除 */
+.workspace-leaf-content[data-type="word-memo-view"] .view-header {
+    display: none;
+}
+
 .word-memo-frame {
     display: block;
     width: 100%;
@@ -147,4 +153,12 @@
 .word-memo-about-btn .svg-icon {
     width: 15px;
     height: 15px;
+}
+
+/* 词忆标志图标（ribbon 与标签页）：字形在 Obsidian 固定的 0 0 100 100 视图框内
+   横向占满、纵向仅约 66%，观感比同排图标小一圈。以中心为原点整体放大 20%，
+   与「查单词」图标视觉等重（svg 内容未越界，缩放不会裁剪） */
+.word-memo-ribbon-logo .svg-icon,
+.workspace-tab-header[data-type="word-memo-view"] .workspace-tab-header-inner-icon .svg-icon {
+    transform: scale(1.1);
 }

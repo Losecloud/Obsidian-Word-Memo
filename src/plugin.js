@@ -1,5 +1,6 @@
 const { Plugin, ItemView, Notice, addIcon, PluginSettingTab, Setting, setIcon } = require('obsidian');
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
@@ -38,6 +39,12 @@ const SEARCH_ICON_CONTENT = '<g transform="scale(1.24782)" fill="currentColor">'
     + '</g>';
 // 完整内联 <svg>（供自绘 DOM，如浮出按钮 / 右键菜单项图标使用）
 const SEARCH_ICON_INLINE_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' + SEARCH_ICON_CONTENT + '</svg>';
+// 词忆标志（static/image/word-memo-logo-medium.svg 的内联副本）：填充式单路径。
+// 原视图框即 0 0 99.97 99.97，已落在 addIcon 要求的 0 0 100 100 内，无需缩放；
+// fill 取 currentColor 与「查单词」图标统一着色，并显式写 fill/stroke 覆盖 Obsidian
+// .svg-icon 默认的描边样式，避免填充路径被额外描边
+const WORD_MEMO_ICON_ID = 'word-memo-logo';
+const WORD_MEMO_ICON_CONTENT = '<path fill="currentColor" stroke="none" d="M50,18.68c-1.69-.01-3.4.26-5,.82-3.41,1.49-5.27,4.2-6.5,7.5l-16,40.5c-.26-5.19-1.4-25.71-1.86-36.33-.51-11.68-3.87-14.46-15.14-14.17-1.48.28-2.9.62-4,2-.5.57-.78,1.54-.5,2.5-.06,1,.35,1.83,1,2.5,3.22,2.58,8.41-.65,9,5l1.5,40c.34,4.13.48,9.33,4,12,3.62,3.04,9.05,1.96,11.5-1.5,1.94-2.53,2.84-5.3,4-8l15.5-39.5c.54-1.06,1.52-1.69,2.5-1.66.98-.03,1.96.61,2.5,1.66l15.5,39.5c1.16,2.7,2.06,5.47,4,8,2.45,3.46,7.88,4.54,11.5,1.5,3.52-2.67,3.66-7.87,4-12l1.5-40c.59-5.65,5.78-2.42,9-5,.65-.67,1.06-1.5,1-2.5.28-.96,0-1.93-.5-2.5-1.1-1.38-2.52-1.72-4-2-11.29-.29-14.45,2.34-15.14,14.17-.62,10.63-1.6,31.12-1.86,36.33l-16-40.5c-1.23-3.3-3.09-6.01-6.5-7.5-1.6-.55-3.31-.83-5-.82Z"/>';
 // 插件仓库地址（与 manifest.authorUrl 一致），设置页「关于」分区的链接目标
 const REPO_URL = 'https://github.com/Losecloud/Obsidian-Word-Memo';
 // 与 js/storage.js 中 _userFile 保持一致的非法字符替换规则
@@ -513,6 +520,51 @@ class StaticServer {
         });
     }
 
+    // 微信读书划线转发：POST /weread
+    // 官方网关 https://i.weread.qq.com/api/agent/gateway 的 CORS 仅放行 weread.qq.com，页面受同源策略
+    // 限制无法直连，故由内置服务在 Node 侧代填 Authorization 后转发（与 tools/serve.js 的 POST /weread 同行为）。
+    // 有了这条通道，Obsidian 端无需用户另行运行 node tools/serve.js；Key 只在内存中过手，不落盘。
+    handleWeread(req, res) {
+        const cors = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, X-Weread-Key'
+        };
+        const send = (code, obj) => {
+            res.writeHead(code, Object.assign({
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': 'no-store'
+            }, cors));
+            res.end(JSON.stringify(obj));
+        };
+        if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+        if (req.method !== 'POST') { send(405, { errcode: -1, errmsg: 'method not allowed' }); return; }
+        let body = '';
+        req.on('data', (c) => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
+        req.on('end', () => {
+            const key = String(req.headers['x-weread-key'] || '').trim();
+            if (key.indexOf('wrk-') !== 0) { send(400, { errcode: -1, errmsg: '缺少微信读书 API Key（X-Weread-Key，格式 wrk-xxxxxxxx）' }); return; }
+            const up = https.request('https://i.weread.qq.com/api/agent/gateway', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + key,
+                    'Content-Length': Buffer.byteLength(body)
+                }
+            }, (upstream) => {
+                res.writeHead(upstream.statusCode || 502, Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, cors));
+                upstream.pipe(res);
+            });
+            up.on('error', (e) => {
+                // 超时销毁时响应头可能已发出（已在 pipe），此时不能再写头，直接收尾
+                if (res.headersSent) { res.end(); return; }
+                send(502, { errcode: -1, errmsg: '转发微信读书失败: ' + e.message });
+            });
+            up.setTimeout(20000, () => { up.destroy(new Error('上游响应超时')); });
+            up.end(body);
+        });
+    }
+
     handle(req, res) {
         let pathname;
         try {
@@ -539,6 +591,12 @@ class StaticServer {
         // 词典卸载：删除 vault 内词典文件并更新清单
         if (pathname === '/delete-dict') {
             this.handleDeleteDict(req, res);
+            return;
+        }
+
+        // 微信读书划线转发：页面无法直连官方网关（CORS 仅放行 weread.qq.com），由内置服务代转发
+        if (pathname === '/weread') {
+            this.handleWeread(req, res);
             return;
         }
 
@@ -723,7 +781,7 @@ class WordMemoView extends FrameView {
 
     getDisplayText() { return '词忆 Word Memo'; }
 
-    getIcon() { return 'layers'; } // 与主页左上角 logo（header-left .logo-icon）同一图案，随 Obsidian 图标灰色着色
+    getIcon() { return WORD_MEMO_ICON_ID; } // 词忆标志，与主页左上角 logo 同一图案，随 Obsidian 图标灰色着色
 }
 
 // 右侧栏查词引擎视图（复用 dict-lookup 查单词框架）
@@ -854,10 +912,14 @@ module.exports = class WordMemoPlugin extends Plugin {
 
         // 注册「查单词（词忆）」统一图标（static/image/search.svg），供 ribbon 与视图标签复用
         addIcon(SEARCH_ICON_ID, SEARCH_ICON_CONTENT);
+        // 注册词忆标志图标（static/image/word-memo-logo-medium.svg），替换原 'layers' 层叠图标
+        addIcon(WORD_MEMO_ICON_ID, WORD_MEMO_ICON_CONTENT);
 
         // 左侧 ribbon：查单词（右侧栏）+ 整页应用（封面视窗不占用 ribbon，仅保留命令/API 入口）
         this.addRibbonIcon(SEARCH_ICON_ID, '查单词（词忆）', () => this.activateDictView());
-        this.addRibbonIcon('layers', '打开词忆 Word Memo', () => this.activateView());
+        // 词忆标志字形在 100×100 视图框内纵向仅占约 66%，观感偏小，加类名由 styles.css 放大
+        this.addRibbonIcon(WORD_MEMO_ICON_ID, '打开词忆 Word Memo', () => this.activateView())
+            .addClass('word-memo-ribbon-logo');
 
         this.addCommand({
             id: 'open-dict-lookup',
