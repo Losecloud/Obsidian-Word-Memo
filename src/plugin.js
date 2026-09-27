@@ -1243,12 +1243,20 @@ module.exports = class WordMemoPlugin extends Plugin {
     // 在右侧栏打开查单词视图（已存在则复用并展开）
     async activateDictView() {
         const { workspace } = this.app;
+        // 首选官方 ensureSideLeaf：保证视图落在右侧栏、并同时展开侧栏与聚焦该标签。
+        // 仅用 getRightLeaf(false) 时，侧栏处于折叠态不会自动展开，且拿不到侧栏叶子时会
+        // 静默退到主区域，表现为「点了图标右侧却不出现」。
+        if (typeof workspace.ensureSideLeaf === 'function') {
+            const leaf = await workspace.ensureSideLeaf(DICT_VIEW_TYPE, 'right', { active: true, reveal: true });
+            if (leaf) return;
+        }
+        // 回退（旧版 Obsidian 无 ensureSideLeaf）：沿用原逻辑，并显式展开折叠的右侧栏
         let leaf = workspace.getLeavesOfType(DICT_VIEW_TYPE)[0];
         if (!leaf) {
-            // 优先落在右侧栏；极少数布局下可能拿不到右侧栏叶子，退回主区域避免静默失败
             leaf = workspace.getRightLeaf(false) || workspace.getLeaf('tab');
             await leaf.setViewState({ type: DICT_VIEW_TYPE, active: true });
         }
+        if (workspace.rightSplit && workspace.rightSplit.collapsed) workspace.rightSplit.expand();
         workspace.revealLeaf(leaf);
     }
 
