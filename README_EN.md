@@ -43,6 +43,7 @@ Hover lookup and selection translate can be turned off in **Settings → Word Me
 
 - Obsidian **1.4.0** or newer, desktop only (Windows / macOS / Linux).
 - No extra files: the Word Memo app ships inside `main.js`. On first run the plugin unpacks it into `.word-memo/` in your vault and serves it over a local `127.0.0.1` server, so the app runs on its own origin and can save configuration normally.
+- The only resource fetched on demand is the **English Poker sound pack** (~160 KB). It is not bundled with the plugin for two reasons: the community marketplace caps plugin package size, and audio would needlessly inflate every user's download; and sound is not a core feature, so users who never play English Poker should not have to carry it. It is therefore **fetched automatically and cached locally the first time you open the English Poker table setup** (in browser storage on Obsidian, and likewise on the web), fully offline afterwards and reusable; a failed download never affects gameplay — you simply have no sound.
 
 <!-- SHARED:BEGIN -->
 
@@ -122,7 +123,7 @@ Word Memo is fully offline for local lookup, review and visual covers. The remot
 
 | Service | Triggered when | Notes |
 | --- | --- | --- |
-| GitHub (`raw.githubusercontent.com`, `github.com/.../releases/download/...`) | Opening the About page, or clicking **下载** on a dictionary pack | Public read-only download of the documentation and the dictionary data file you asked for. No data is sent. |
+| GitHub (`raw.githubusercontent.com`, `github.com/.../releases/download/...`) | Opening the About page, clicking **下载** on a dictionary pack, or opening the **English Poker** table setup | Public read-only download of the documentation, the dictionary data you asked for, and the English Poker sound pack (~160 KB, fetched automatically on first entering the setup screen and cached locally, offline afterwards). No data is sent. |
 | Your AI provider (OpenAI, SiliconFlow, or any OpenAI-compatible endpoint) | When you request a translation or an AI explanation, or when entries are filled in after an import | Endpoint and API key are configured by you and stored locally. Nothing is sent without your action. |
 | Eudic OpenAPI (`api.frdic.com`) | When you use the Eudic integration | Requires your own token. |
 | WeRead (`i.weread.qq.com`) | When you load the English classics ranking, or export highlights | Requires your own key. |
