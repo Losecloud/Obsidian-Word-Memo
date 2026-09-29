@@ -71,6 +71,58 @@
     background: var(--background-modifier-hover);
 }
 
+/* ---- 调试：OCR 取景框可视化 ---------------------------------------
+   pointer-events:none 保证绝不拦截鼠标；配色使用 :root 变量适配深浅主题 */
+
+/* 叠加在图源上的取景框高亮矩形 */
+.word-memo-ocr-debug-rect {
+    position: fixed;
+    z-index: var(--layer-popover, 40);
+    pointer-events: none;
+    border: 2px solid var(--color-red, #e93147);
+    border-radius: 3px;
+    background: rgba(233, 49, 71, 0.16);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6);
+}
+
+/* 右下角的裁剪预览卡片 */
+.word-memo-ocr-debug {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: var(--layer-popover, 40);
+    pointer-events: none;
+    max-width: 320px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--background-secondary, #2a2a2a);
+    border: 1px solid var(--background-modifier-border, rgba(255, 255, 255, 0.1));
+    box-shadow: var(--shadow-s, 0 4px 14px rgba(0, 0, 0, 0.35));
+}
+
+.word-memo-ocr-debug-title {
+    margin-bottom: 6px;
+    font-size: var(--font-ui-smaller);
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+.word-memo-ocr-debug canvas {
+    display: block;
+    max-width: 300px;
+    border: 1px solid var(--background-modifier-border, rgba(255, 255, 255, 0.12));
+    border-radius: 4px;
+    background: #fff;
+}
+
+.word-memo-ocr-debug-info {
+    margin-top: 6px;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    line-height: 1.4;
+    word-break: break-all;
+}
+
 /* ---- 设置页：单页分区布局 -------------------------------------------
    排版参考 Hearth 的 section 结构：分区标题/描述在盒子外，原生 .setting-item
    行装在圆角描边盒子内。全部使用 :root 变量，自动适配深浅主题 */

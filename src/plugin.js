@@ -3,8 +3,10 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const zlib = require('zlib');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 
 const VIEW_TYPE = 'word-memo-view';
 // 右侧栏「查单词」视图（复用同一入口页的 dict-lookup 引擎，?wmView=dict 切换为侧栏模式）
@@ -22,6 +24,53 @@ const PORT_TRIES = 10;
 const HOVER_DELAY = 500;
 // 悬浮取词的取词节流间隔（毫秒），降低 caretRangeFromPoint 的调用开销
 const HOVER_TICK = 80;
+// 已获识别结果后，鼠标需移动超过该像素距离才再次尝试取词（期间保持右侧当前词汇不变）。
+// 小于此值的抖动不触发新取词，避免原位反复取景与反复 OCR
+const HOVER_MOVE_THRESHOLD = 12;
+// 图片悬浮取词（OCR）：命中图片时用 Windows 系统 OCR 识别光标下的单词。
+// 取景框从鼠标位置起，按行/列墨迹投影自动延伸到词边界，再精准裁剪放大后送 OCR
+const OCR_MAX_CROP_W = 120;   // 取景框单侧搜索下限（原图像素）；上限随字高自适应，未定界时再放大 50% 重试
+const OCR_TARGET_H = 40;      // 裁剪后目标字高（像素）：放大到这个高度附近 OCR 最稳
+const OCR_UPSCALE_MAX = 4;    // 裁剪放大倍数上限
+const OCR_CROP_PAD = 2;       // 裁剪四周留白（原图像素），避免切掉升部/降部
+const OCR_INK_CACHE = 3;      // 二值墨迹图缓存张数（单张可达数 MB，按 LRU 控制内存）
+const OCR_WORD_CACHE = 64;    // 取景框哈希 → 词 的缓存条数，避免同一单词重复 OCR
+// Windows 系统 OCR（Windows.Media.Ocr）调用脚本：由宿主 spawn powershell.exe 执行，
+// 输入图片路径经环境变量 WM_OCR_IMG 传入，输出 JSON 词表（含 bounding box）。
+// 用 -EncodedCommand 传递可避免在磁盘落地 .ps1；只能用 powershell.exe（5.1），
+// pwsh(7) 不支持 WinRT 投影。
+const OCR_PS_SCRIPT = [
+    "$ErrorActionPreference = 'Stop'",
+    'try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}',
+    'Add-Type -AssemblyName System.Runtime.WindowsRuntime',
+    "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]",
+    'function Await($op, $t) {',
+    '  $task = $asTaskGeneric.MakeGenericMethod($t).Invoke($null, @($op))',
+    '  $task.Wait(-1) | Out-Null',
+    '  $task.Result',
+    '}',
+    '[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null',
+    '[Windows.Storage.Streams.IRandomAccessStream,Windows.Storage.Streams,ContentType=WindowsRuntime] | Out-Null',
+    '[Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics.Imaging,ContentType=WindowsRuntime] | Out-Null',
+    '[Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime] | Out-Null',
+    '$path = $env:WM_OCR_IMG',
+    '$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])',
+    '$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])',
+    '$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])',
+    '$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])',
+    '$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()',
+    'if ($engine -eq $null) { throw "no OCR engine available" }',
+    '$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])',
+    '$out = @()',
+    'foreach ($line in $result.Lines) { foreach ($w in $line.Words) { $r = $w.BoundingRect; $out += [pscustomobject]@{ text = $w.Text; x = [int]$r.X; y = [int]$r.Y; w = [int]$r.Width; h = [int]$r.Height } } }',
+    'ConvertTo-Json -Compress -InputObject @($out)'
+].join('\n');
+// base64(UTF-16LE) 编码后的脚本，惰性生成一次
+let OCR_PS_ENCODED = '';
+function ocrEncodedCommand() {
+    if (!OCR_PS_ENCODED) OCR_PS_ENCODED = Buffer.from(OCR_PS_SCRIPT, 'utf16le').toString('base64');
+    return OCR_PS_ENCODED;
+}
 // 内部桥接接口前缀（供页面读写 user/ 目录）
 const BRIDGE_PREFIX = '/__wm__/';
 // 用户配置目录（相对 vault 根目录）
@@ -243,17 +292,258 @@ function wordAtPoint(x, y) {
     return /^[A-Za-z][A-Za-z'’-]*$/.test(word) ? word : '';
 }
 
-// 悬浮取词的上下文：按叶子视图类型分流，不依赖各版本易变的容器类名
-// 返回 { kind: 'note' | 'pdf' }；仅文本取词（笔记正文与 PDF 文本层），图片等非文本内容不处理
+// 悬浮取词的上下文：按叶子视图类型分流，不依赖各版本易变的容器类名。
+// 除笔记正文与 PDF 文本层外，Obsidian 内任意内容面板（第三方视图、Canvas、属性区等）
+// 的 DOM 文本同样可取词；仅排除本插件自身视图与视图抬头（标签标题/前进后退/⋮）
 function hoverContext(el) {
     if (!el || typeof el.closest !== 'function') return null;
     const leaf = el.closest('.workspace-leaf-content');
-    const dtype = leaf && leaf.getAttribute('data-type');
+    if (!leaf) return null;
+    const dtype = leaf.getAttribute('data-type');
+    if (dtype === VIEW_TYPE || dtype === DICT_VIEW_TYPE || dtype === COVER_VIEW_TYPE) return null;
+    if (el.closest('.view-header')) return null; // 抬头里的文件名/按钮不作为取词对象
     // PDF：内置 PDF 视图，或笔记内嵌的 PDF（此时叶子类型仍是 markdown）
     if (dtype === 'pdf' || el.closest('.pdf-embed, .pdf-viewer, .pdf-container')) return { kind: 'pdf' };
     if (el.closest('.markdown-source-view, .markdown-reading-view')) return { kind: 'note' };
-    return null;
+    return { kind: 'pane' };
 }
+
+// —— 图片取词：取景框（墨迹投影 + 归一化哈希）与 OCR 相关工具 ——
+
+// Map 版 LRU：写入并把最旧的挤出（用于墨迹图 / 取景框词缓存）
+function cacheSet(map, key, val, max) {
+    if (map.has(key)) map.delete(key);
+    map.set(key, val);
+    while (map.size > max) map.delete(map.keys().next().value);
+}
+
+// Otsu 自动阈值：按直方图取类间方差最大的分割点，适配不同曝光的截图/书页；
+// 同时用于「列空隙长度」直方图，因此按传入直方图的实际长度遍历（不必是 256）
+function otsuThreshold(hist, total) {
+    const n = hist.length;
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += i * hist[i];
+    let sumB = 0, wB = 0, max = 0, thr = Math.min(128, n - 1);
+    for (let t = 0; t < n; t++) {
+        wB += hist[t];
+        if (!wB) continue;
+        const wF = total - wB;
+        if (!wF) break;
+        sumB += t * hist[t];
+        const mB = sumB / wB, mF = (sum - sumB) / wF;
+        const between = wB * wF * (mB - mF) * (mB - mF);
+        if (between > max) { max = between; thr = t; }
+    }
+    return thr;
+}
+
+// 从光标所在行向上/下按「行墨迹数」扩展，得到该文本行的纵向范围。
+// 关键：以光标附近的行墨迹「峰值」设噪声门限——文本行墨迹数远高于细线/抗锯齿噪点行
+// （如思维导图的连接线、扫描噪点），低于门限的行视为空行，避免沿细线扩张成整幅高度。
+// 并用「密集核心」（≈ x-height 带）估计行高，限制纵向扩张，不并入相邻行或图形元素
+function lineBand(rows, rowMax, w, h, iy) {
+    if (!rows || iy < 0 || iy >= h) return null;
+    // 表格横线/分隔线：单行内存在一段几乎贯穿整幅的连续墨迹。这类行不是文字行，
+    // 参与行投影会在光标落在表格线上时把整条线当成"文字"，故一律按空行处理
+    const ruleMax = w * 0.45;
+    const inkAt = (y) => (rowMax && rowMax[y] >= ruleMax ? 0 : rows[y]);
+    const win = Math.max(3, Math.round(h * 0.012));
+    let peak = 0;
+    for (let y = Math.max(0, iy - win); y <= Math.min(h - 1, iy + win); y++) { const v = inkAt(y); if (v > peak) peak = v; }
+    if (peak <= 0) for (let y = 0; y < h; y++) { const v = inkAt(y); if (v > peak) peak = v; } // 光标附近无文字行：退到全局峰值
+    if (peak <= 0) return null;
+    const floor = Math.max(2, Math.round(peak * 0.15)); // 行墨迹噪声门限
+    const gapTol = Math.max(2, Math.round(h * 0.004));
+    let seed = -1;
+    // 就近搜索距离：光标可能落在表格线/行间空白，允许向上/下找最近的一条文字行
+    const reach = Math.max(8, Math.min(120, Math.round(h * 0.25)));
+    for (let d = 0; d <= reach && seed < 0; d++) {
+        if (iy + d < h && inkAt(iy + d) >= floor) seed = iy + d;
+        else if (iy - d >= 0 && inkAt(iy - d) >= floor) seed = iy - d;
+    }
+    if (seed < 0) return null;
+    // 密集核心：围绕种子行、密度 ≥ 峰值一半的连续行，作为字号/行高的可靠估计
+    let coreTop = seed, coreBot = seed;
+    for (let y = seed - 1; y >= 0 && inkAt(y) >= peak * 0.5; y--) coreTop = y;
+    for (let y = seed + 1; y < h && inkAt(y) >= peak * 0.5; y++) coreBot = y;
+    const maxSpan = Math.max(6, Math.round((coreBot - coreTop + 1) * 2.5)); // 单行高度上限
+    let top = seed, bot = seed, gap = 0;
+    for (let y = seed - 1; y >= 0 && seed - y <= maxSpan; y--) {
+        if (inkAt(y) >= floor) { top = y; gap = 0; } else if (++gap > gapTol) break;
+    }
+    gap = 0;
+    for (let y = seed + 1; y < h && y - seed <= maxSpan; y++) {
+        if (inkAt(y) >= floor) { bot = y; gap = 0; } else if (++gap > gapTol) break;
+    }
+    return { y0: top, y1: bot + 1 };
+}
+
+// 统计某纵向区间内每一列含墨迹的像素数（列向墨迹投影）
+function columnInk(ink, w, y0, y1) {
+    const cols = new Int32Array(w);
+    for (let y = y0; y < y1; y++) {
+        const base = y * w;
+        for (let x = 0; x < w; x++) if (ink[base + x]) cols[x]++;
+    }
+    return cols;
+}
+
+// 求该行的「词间空格」阈值：词间空格应显著大于字内笔画间隙（离群）。
+// 用中位数代表字内间隙、最大值候选词间空格：仅当最大间隙明显离群时才对半分割，
+// 否则返回一个「不会截断」的大阈值——避免长单词被字内间隙切碎（旧实现此处恰好写反）
+function spaceThreshold(gapVals, charH) {
+    const minGap = Math.max(2, Math.round(charH * 0.10)); // 小于此值一律视为字内间隙
+    const noSplit = Math.max(1, Math.round(charH * 50));  // 「本行不断词」：阈值大于任何字内间隙
+    const big = [];
+    for (let i = 0; i < gapVals.length; i++) if (gapVals[i] >= minGap) big.push(gapVals[i]);
+    if (big.length < 2) return noSplit;
+    big.sort((a, b) => a - b);
+    const med = big[big.length >> 1];
+    const max = big[big.length - 1];
+    // 无显著离群（最大间隙不够大）：视为同一单词内部，不截断
+    if (max < med * 2.5 || max < charH * 0.35) return noSplit;
+    // 有离群：阈值取「字内中位的 2 倍」，恰好落在字内间隙与词间空格之间
+    return Math.max(med * 2, minGap + 1);
+}
+
+// 剔除列投影中的「竖直表格线/边框」：某列在本行带上下各约两倍带高的范围内几乎全程有
+// 墨迹，说明它是贯穿的竖线（表格边框、分隔线）而非字母笔画，置零以免被并入单词边界
+function clearVerticalRules(cols, ink, w, h, y0, y1) {
+    const bh = Math.max(1, y1 - y0);
+    const lo = Math.max(0, y0 - bh * 2);
+    const hi = Math.min(h, y1 + bh * 2);
+    const span = hi - lo;
+    if (span <= bh) return cols; // 纵向可检区间不足：无从判断
+    const need = Math.round(span * 0.85);
+    for (let x = 0; x < w; x++) {
+        if (cols[x] <= 0) continue;
+        let c = 0;
+        for (let y = lo; y < hi; y++) if (ink[y * w + x]) c++;
+        if (c >= need) cols[x] = 0;
+    }
+    return cols;
+}
+
+// 从光标所在列向左右扩展到单词边界：以「词间空格」为界，而非固定宽度或光标居中。
+// capW 为单侧搜索上限（防止阈值失灵时把整行并入）；clipped 表示因触及上限/图像边缘而未能定界
+function wordBand(cols, w, ix, charH, capW) {
+    if (ix < 0 || ix >= w) return null;
+    // 光标可能落在词间空白：就近找一根有墨迹的列作为种子
+    let seed = -1;
+    const reach = Math.max(4, Math.round(charH));
+    for (let d = 0; d <= reach && seed < 0; d++) {
+        if (ix + d < w && cols[ix + d] > 0) seed = ix + d;
+        else if (ix - d >= 0 && cols[ix - d] > 0) seed = ix - d;
+    }
+    if (seed < 0) return null;
+    // 该行的墨迹列范围与其间的空隙长度分布（用于自适应判定词间空格）
+    let first = -1, last = -1;
+    for (let x = 0; x < w; x++) if (cols[x] > 0) { if (first < 0) first = x; last = x; }
+    const gapVals = [];
+    let run = 0;
+    for (let x = first; x <= last; x++) {
+        if (cols[x] > 0) { if (run > 0) gapVals.push(run); run = 0; }
+        else run++;
+    }
+    const spaceThr = spaceThreshold(gapVals, charH);
+    let left = seed, right = seed, gap = 0, clipped = false;
+    for (let x = seed - 1; x >= 0; x--) {
+        if (cols[x] > 0) { left = x; gap = 0; }
+        else if (++gap >= spaceThr) break; // 遇到词间空格：词左边界到此为止
+        if (seed - x >= capW) { clipped = true; break; } // 触及搜索上限：边界未确定
+    }
+    gap = 0;
+    for (let x = seed + 1; x < w; x++) {
+        if (cols[x] > 0) { right = x; gap = 0; }
+        else if (++gap >= spaceThr) break;
+        if (x - seed >= capW) { clipped = true; break; }
+    }
+    if (left === 0 && cols[0] > 0) clipped = true;      // 边界贴到图像边缘：该侧可能被裁掉
+    if (right === w - 1 && cols[w - 1] > 0) clipped = true;
+    return { x0: left, x1: right + 1, clipped: clipped };
+}
+
+// 在「词的水平区间」内重算纵向范围：行投影只统计该词列区间内的墨迹，
+// 从而把升部（W/h/t 顶）与降部（y/g 底）完整纳入——避免整行噪声门限把字母顶/底切掉，
+// 使取景框贴合整个单词高度（额外 buffer 由裁剪时再加）
+function wordVerticalBand(ink, w, h, x0, x1, y0, y1) {
+    const ch = Math.max(4, y1 - y0);
+    const lo = Math.max(0, y0 - Math.round(ch * 2)); // 允许上下各扩展约两倍字高
+    const hi = Math.min(h, y1 + Math.round(ch * 2));
+    const n = hi - lo;
+    if (n <= 0 || x1 <= x0) return { y0: y0, y1: y1 };
+    const counts = new Int32Array(n);
+    let peak = 0, seed = 0;
+    for (let y = 0; y < n; y++) {
+        const base = (lo + y) * w;
+        let c = 0;
+        for (let x = x0; x < x1; x++) if (ink[base + x]) c++;
+        counts[y] = c;
+        if (c > peak) { peak = c; seed = y; }
+    }
+    if (peak <= 0) return { y0: y0, y1: y1 };
+    const floor = Math.max(1, Math.round(peak * 0.05)); // 小额门限：纳入升部/降部，排除零星噪点
+    const gapTol = Math.max(1, Math.round(ch * 0.12));
+    let top = seed, bot = seed, gap = 0;
+    for (let y = seed - 1; y >= 0; y--) {
+        if (counts[y] >= floor) { top = y; gap = 0; } else if (++gap > gapTol) break;
+    }
+    gap = 0;
+    for (let y = seed + 1; y < n; y++) {
+        if (counts[y] >= floor) { bot = y; gap = 0; } else if (++gap > gapTol) break;
+    }
+    return { y0: lo + top, y1: lo + bot + 1 };
+}
+
+// 取景框的归一化哈希：把墨迹区缩放成 16×8 栅格，按各格墨迹占比二值化成 128 位串。
+// 同一单词无论鼠标在词内何处，取景框哈希一致——既用于「确认词边界」，也作为 OCR 结果缓存键
+function regionHash(ink, w, x0, y0, x1, y1) {
+    const GW = 16, GH = 8;
+    const cw = x1 - x0, ch = y1 - y0;
+    if (cw <= 0 || ch <= 0) return '0';
+    let bits = '';
+    for (let gy = 0; gy < GH; gy++) {
+        const sy = y0 + Math.floor(ch * gy / GH);
+        const ey = Math.max(sy + 1, y0 + Math.floor(ch * (gy + 1) / GH));
+        for (let gx = 0; gx < GW; gx++) {
+            const sx = x0 + Math.floor(cw * gx / GW);
+            const ex = Math.max(sx + 1, x0 + Math.floor(cw * (gx + 1) / GW));
+            let on = 0, tot = 0;
+            for (let y = sy; y < ey; y++) {
+                const base = y * w;
+                for (let x = sx; x < ex; x++) { tot++; if (ink[base + x]) on++; }
+            }
+            bits += (tot && on / tot >= 0.18) ? '1' : '0';
+        }
+    }
+    return bits;
+}
+
+// 归一化 OCR 结果：只保留英文单词本体（去首尾标点，允许词内连字符/撇号）
+function normalizeOcrWord(s) {
+    const t = String(s || '').replace(/^[^A-Za-z]+/, '').replace(/[^A-Za-z'’-]+$/, '')
+        .replace(/^['’-]+|['’-]+$/g, '');
+    return /^[A-Za-z][A-Za-z'’-]*$/.test(t) ? t : '';
+}
+
+// 从 OCR 词表里挑出光标所在的词（裁剪区已收到单个词，通常只有一条；多条时取包含光标者，
+// 否则退回距光标中点最近者）
+function pickOcrWord(words, px, py) {
+    let best = '', bestD = Infinity;
+    (words || []).forEach((it) => {
+        const t = normalizeOcrWord(it.text);
+        if (!t) return;
+        const cx = Number(it.x) || 0, cy = Number(it.y) || 0;
+        const cw = Number(it.w) || 0, ch = Number(it.h) || 0;
+        if (px >= cx - 4 && px <= cx + cw + 4 && py >= cy - 4 && py <= cy + ch + 4) { best = t; bestD = -1; return; }
+        if (bestD === -1) return;
+        const dx = px - (cx + cw / 2), dy = py - (cy + ch / 2);
+        const d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = t; }
+    });
+    return best;
+}
+
 
 // 解压内嵌应用包（发行版由 tools/web2ob.py 注入 WM_APP_BUNDLE）到 vault 内的 APP_DIR，
 // 返回该目录绝对路径；开发态（未注入）返回 null，调用方回退到 vault 根目录。
@@ -678,6 +968,8 @@ class FrameView extends ItemView {
         this.frame.addEventListener('load', () => {
             this.loaded = true;
             this.pushTheme();
+            // 宿主功能开关随主题一并注入（页面据此决定查词跳转等行为）
+            if (typeof this.plugin.pushSettingsToFrame === 'function') this.plugin.pushSettingsToFrame(this);
             this.flushPending();
         });
         this.observer = new MutationObserver(() => this.pushTheme());
@@ -829,7 +1121,8 @@ class WordMemoSettingTab extends PluginSettingTab {
         containerEl.empty();
         containerEl.addClass('word-memo-settings');
         this.renderBack(containerEl);
-        // 单一分区：按社区规范不设顶层标题（尤其不使用插件名）；分区头留待出现多分区时再启用
+        // 不设顶层标题（尤其不使用插件名）；分区头在各分区内呈现
+        this.section(containerEl, '取词', '文本层直接取词；图片则用系统 OCR 识别光标下的单词。', (body) => this.lookupSection(body));
         this.section(containerEl, null, null, (body) => this.aboutSection(body));
     }
 
@@ -855,6 +1148,42 @@ class WordMemoSettingTab extends PluginSettingTab {
         }
         const body = section.createDiv({ cls: 'word-memo-section-body' });
         render(body);
+    }
+
+    // 取词分区：宿主功能开关（悬浮取词 / 划词查询 / 右侧窗口查词）+ 取景框调试
+    lookupSection(body) {
+        new Setting(body)
+            .setName('悬浮取词')
+            .setDesc('鼠标在笔记文字上停留 0.5 秒即推送到右侧栏查词；停在图片/扫描页上时用 Windows 系统 OCR 识别光标下的单词（仅 Windows 桌面端，首次识别稍慢，之后走缓存）。关闭后不再取词。')
+            .addToggle((tg) => tg.setValue(this.plugin.obSettings.hoverLookup !== false).onChange(async (v) => {
+                this.plugin.obSettings.hoverLookup = v;
+                if (!v) this.plugin.cancelHover();
+                await this.plugin.persistLocalSettings();
+            }));
+        new Setting(body)
+            .setName('取景框')
+            .setDesc('开启后，图片取词命中时在原图上高亮 OCR 取景框，并在右下角浮出送识别的裁剪图（3 秒后自动消失，不遮挡操作）。用于诊断识别不准的问题，默认关闭。')
+            .addToggle((tg) => tg.setValue(this.plugin.ocrDebug).onChange(async (v) => {
+                this.plugin.ocrDebug = v;
+                if (!v) this.plugin.hideOcrDebug();
+                await this.plugin.persistLocalSettings();
+            }));
+        new Setting(body)
+            .setName('划词查询')
+            .setDesc('选中文本右键「查询」：单词显示词典释义，句子或中文由 AI 翻译并解读。')
+            .addToggle((tg) => tg.setValue(this.plugin.obSettings.selectionTranslate !== false).onChange(async (v) => {
+                this.plugin.obSettings.selectionTranslate = v;
+                if (!v) this.plugin.hidePdfBtn();
+                await this.plugin.persistLocalSettings();
+            }));
+        new Setting(body)
+            .setName('右侧窗口查词')
+            .setDesc('开启后「查看词典详情」改由 Obsidian 右侧栏展示，主页不弹浮层。')
+            .addToggle((tg) => tg.setValue(this.plugin.obSettings.dictLookupInSidebar !== false).onChange(async (v) => {
+                this.plugin.obSettings.dictLookupInSidebar = v;
+                await this.plugin.persistLocalSettings();
+                this.plugin.pushSettingsToAllFrames();
+            }));
     }
 
     aboutSection(body) {
@@ -891,17 +1220,33 @@ module.exports = class WordMemoPlugin extends Plugin {
         this.server = null;
         this.baseUrl = null;
 
-        // 宿主侧功能开关（悬浮取词 / 划词翻译）：由主页「页面设置」实时回传，未设置过时默认开启。
-        // 同时把上次收到的值持久化，重启 Obsidian 后无需打开主页也能沿用
-        this.obSettings = { hoverLookup: true, selectionTranslate: true };
-        this.obSettingsFromHost = false;
+        // 宿主侧功能开关：悬浮取词（文本 + 图片 OCR）/ 划词查询 / 右侧窗口查词。
+        // 均在插件设置页维护，持久化到插件数据；右侧窗口查词另注入 iframe 供页面使用
+        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true };
         this.hoverWord = ''; // 当前悬浮所在单词（同一单词不重复查询、不重置计时）
         this.hoverTimer = null;
         this.hoverTick = 0; // 取词节流时间戳
+        this.hoverX = -1e9; // 上次取词时的鼠标位置：图片取词需移动超过阈值才再次取景
+        this.hoverY = -1e9;
+        // 图片取词（OCR）：状态机 + 惰性缓存。Windows 系统 OCR，首次成功后置 'on'，
+        // 连续失败两次置 'off'（非 Windows 或系统无 OCR 语言包时静默降级为仅文本取词）。
+        // 是否启用跟随「悬浮取词」总开关
+        this.ocrDebug = false;     // 调试：显示 OCR 实际取景框与被识别裁剪图（默认关闭）
+        this.ocrState = 'unknown'; // unknown | on | off
+        this.ocrBusy = false;      // 同一时刻只跑一次 OCR，避免并发 spawn powershell
+        this.ocrFail = 0;
+        this.hoverId = 0;          // 悬浮代次：异步取词/OCR 回来时用它判断是否已被更新的移动取代
+        this.ocrElId = 0;          // 图源元素自增 id：用于取景框词缓存键
+        this.imgInk = new Map();   // 图源元素 → { w, h, ink, rows }（LRU，二值墨迹图）
+        this.imgWords = new Map(); // 取景框哈希 → 词（LRU，避免同一单词重复 OCR）
+        this.ocrDebugBox = null;   // 调试取景框：跟随光标显示的取景预览面板
+        this.ocrDebugRect = null;  // 调试取景框：叠加在图源上的高亮矩形
+        this.ocrDebugTimer = null;
         this.pdfBtn = null; // PDF 划词浮出的「译」按钮
         this.pdfBtnText = '';
         this.loadData().then((saved) => {
-            if (!this.obSettingsFromHost && saved && saved.obSettings) Object.assign(this.obSettings, saved.obSettings);
+            if (saved && saved.obSettings) Object.assign(this.obSettings, saved.obSettings);
+            if (saved && saved.ocrDebug === true) this.ocrDebug = true;
         }).catch(() => { /* 忽略 */ });
 
         // 视图 / 命令必须同步注册：Obsidian 恢复上次布局时会按 workspace.json 重建标签页，
@@ -960,8 +1305,9 @@ module.exports = class WordMemoPlugin extends Plugin {
         // 悬浮取词：鼠标在笔记文本上停留 0.5s 后，把该单词推给右侧栏查词面板。
         // 节流降低取词开销；拖拽/滚动/点击时立即取消，避免误触发
         this.registerDomEvent(document, 'mousemove', (e) => this.onHoverMove(e));
-        this.registerDomEvent(document, 'mousedown', () => this.cancelHover());
-        this.registerDomEvent(window, 'scroll', () => this.cancelHover(), true);
+        // 点击/滚动后重置取词锚点：下一次悬浮即视为新位置，可立即取词
+        this.registerDomEvent(document, 'mousedown', () => { this.hoverX = -1e9; this.hoverY = -1e9; this.cancelHover(); });
+        this.registerDomEvent(window, 'scroll', () => { this.hoverX = -1e9; this.hoverY = -1e9; this.cancelHover(); }, true);
 
         // PDF 划词翻译：内置 PDF 查看器不触发 editor-menu，故自绘「浮出按钮 + 原生右键菜单项」两个入口
         this.initPdfSelection();
@@ -970,7 +1316,7 @@ module.exports = class WordMemoPlugin extends Plugin {
         // 尚未激活（端口探测若卡住，await 会让插件一直处于未激活态，标签页报「插件不再活动」）。
         this.startServer();
 
-        // 主页 iframe 发来的消息：查词跳转请求 + 「页面设置」功能开关回传
+        // 主页 iframe 发来的消息：查词跳转请求
         this.registerDomEvent(window, 'message', (e) => {
             const d = e.data;
             if (!d || typeof d.type !== 'string') return;
@@ -983,28 +1329,32 @@ module.exports = class WordMemoPlugin extends Plugin {
             if (d.type === 'wm-dict-lookup' && d.word) {
                 // 「查看词典详情」：转交右侧栏查词视图承接，主页不弹结果窗口
                 this.lookupInDictView(String(d.word));
-            } else if (d.type === 'wm-ob-settings') {
-                // 页面设置里的「悬浮取词」「划词翻译」开关
-                this.applyHostSettings(d);
             }
         });
     }
 
-    // 接收主页回传的功能开关：即时生效并持久化，重启后无需打开主页也能沿用
-    applyHostSettings(d) {
-        this.obSettingsFromHost = true;
-        this.obSettings = {
-            hoverLookup: d.hoverLookup !== false,
-            selectionTranslate: d.selectionTranslate !== false
-        };
-        if (!this.obSettings.hoverLookup) this.cancelHover();
-        if (!this.obSettings.selectionTranslate) this.hidePdfBtn(); // 关闭划词翻译时收起 PDF 浮出按钮
-        this.loadData()
-            .then((saved) => this.saveData(Object.assign({}, saved || {}, { obSettings: this.obSettings })))
-            .catch(() => { /* 忽略 */ });
+    // 向单个 iframe 注入宿主功能开关（页面据此决定「查看词典详情」是否交右侧栏承接）
+    pushSettingsToFrame(view) {
+        view.postToFrame({
+            type: 'wm-ob-settings',
+            hoverLookup: this.obSettings.hoverLookup !== false,
+            selectionTranslate: this.obSettings.selectionTranslate !== false,
+            dictLookupInSidebar: this.obSettings.dictLookupInSidebar !== false
+        });
     }
 
-    // 悬浮取词：笔记正文与 PDF 文本层直接取词，同一位置停留 HOVER_DELAY 后推给右侧栏
+    // 向所有已打开的 iframe 视图广播宿主功能开关（设置变更即时生效，无需重载页面）
+    pushSettingsToAllFrames() {
+        [VIEW_TYPE, DICT_VIEW_TYPE].forEach((t) => {
+            this.app.workspace.getLeavesOfType(t).forEach((leaf) => {
+                const view = leaf.view;
+                if (view && typeof view.postToFrame === 'function') this.pushSettingsToFrame(view);
+            });
+        });
+    }
+
+    // 悬浮取词：文本层直接取词；无文本层时尝试图片取词（OCR）。
+    // 已获结果后不主动清空右侧显示；图片取词需鼠标移动超过 HOVER_MOVE_THRESHOLD 才再次取景
     onHoverMove(e) {
         if (!this.obSettings.hoverLookup) return;
         if (e.buttons) return; // 正在拖拽/选择文本
@@ -1013,14 +1363,27 @@ module.exports = class WordMemoPlugin extends Plugin {
         this.hoverTick = now;
         const sel = window.getSelection();
         if (sel && !sel.isCollapsed && String(sel).trim()) { this.cancelHover(); return; } // 已有选区时不打扰
-        if (!hoverContext(e.target)) { this.cancelHover(); return; } // 笔记/PDF 之外（侧栏、菜单等）不取词
+        if (!hoverContext(e.target)) { this.cancelHover(); return; } // 本插件视图/菜单等不取词
         const word = wordAtPoint(e.clientX, e.clientY);
-        if (word) this.onHoverWord(word);
-        else this.cancelHover(); // 空白处（如扫描页无文本层）保持安静
+        if (word) { // 文本层命中：直接进入 0.5s 计时（同一单词不重复触发、不重置）
+            this.hoverX = e.clientX;
+            this.hoverY = e.clientY;
+            this.onHoverWord(word);
+            return;
+        }
+        // 文本层没取到词：可能是图片（含无文本层的扫描页/截图）。
+        // 仅当鼠标移动超过阈值时才再次取景，避免停在原地抖动时反复取景 / 反复 OCR；
+        // 停顿在空白处不触发，右侧继续保持当前词汇
+        const dx = e.clientX - this.hoverX, dy = e.clientY - this.hoverY;
+        if (dx * dx + dy * dy < HOVER_MOVE_THRESHOLD * HOVER_MOVE_THRESHOLD) return;
+        this.hoverX = e.clientX;
+        this.hoverY = e.clientY;
+        this.onHoverImage(e.clientX, e.clientY);
     }
 
     // 文本取词：同一单词不重置计时，也不重复查询
     onHoverWord(word) {
+        this.hoverId += 1; // 作废尚未返回的图片取词异步任务
         if (word === this.hoverWord) return;
         this.hoverWord = word;
         if (this.hoverTimer) clearTimeout(this.hoverTimer);
@@ -1032,6 +1395,7 @@ module.exports = class WordMemoPlugin extends Plugin {
 
     // 取消当前悬浮取词计时
     cancelHover() {
+        this.hoverId += 1;
         this.hoverWord = '';
         if (this.hoverTimer) {
             clearTimeout(this.hoverTimer);
@@ -1039,12 +1403,316 @@ module.exports = class WordMemoPlugin extends Plugin {
         }
     }
 
-    // PDF 划词翻译：内置 PDF 查看器不触发 editor-menu 事件，故自绘两个入口
-    // 入口一：选中文本后在选区旁浮出「译」按钮；入口二：把「翻译」追加进 PDF 右键菜单
+    // —— 图片取词（OCR，Windows 系统能力；失败则静默降级为仅文本取词）——
+
+    // OCR 是否可用：悬浮取词关闭 / 非 Windows / 此前连续失败时直接跳过
+    ocrAvailable() {
+        if (!this.obSettings.hoverLookup || this.ocrState === 'off') return false;
+        if (process.platform !== 'win32') { this.ocrState = 'off'; return false; }
+        return true;
+    }
+
+    // 光标下的可 OCR 图源：<img>（笔记图片，实时预览/阅读视图通用）或 <canvas>（PDF 页面等）。
+    // 直接对已显示的 DOM 元素取像素，无需解析 vault 路径，从而兼容实时预览与任意来源图片
+    ocrSourceAtPoint(x, y) {
+        const el = document.elementFromPoint(x, y);
+        if (!el) return null;
+        const findTag = (tag) => (el.tagName === tag ? el : (typeof el.closest === 'function' ? el.closest(tag.toLowerCase()) : null));
+        const img = findTag('IMG');
+        if (img) {
+            const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+            return w && h ? { el: img, w: w, h: h } : null;
+        }
+        let cv = findTag('CANVAS');
+        // PDF 页面里文字层与 canvas 是兄弟/表亲节点，命中文字层时向上找最近的含 canvas 的祖先
+        if (!cv) {
+            let a = el;
+            while (a && a !== document.body) {
+                const c = typeof a.querySelector === 'function' ? a.querySelector('canvas') : null;
+                if (c) { cv = c; break; }
+                a = a.parentElement;
+            }
+        }
+        return cv && cv.width && cv.height ? { el: cv, w: cv.width, h: cv.height } : null;
+    }
+
+    // 图源稳定 id：作为取景框词缓存键的前缀（元素在 DOM 生命周期内不变）
+    ocrSourceId(el) {
+        if (!el.__wmOcrId) el.__wmOcrId = 's' + (++this.ocrElId);
+        return el.__wmOcrId;
+    }
+
+    // 图源的二值墨迹图（LRU 缓存）：行/列投影与取景框哈希都基于它。
+    // 墨迹取灰度直方图 Otsu 分割后像素较少的一类，深底浅字/浅底深字都能正确识别
+    getInkMeta(src) {
+        const el = src.el;
+        const hit = this.imgInk.get(el);
+        if (hit) { cacheSet(this.imgInk, el, hit, OCR_INK_CACHE); return hit; }
+        const w = src.w, h = src.h;
+        if (!w || !h || w * h > 64 * 1000 * 1000) return null; // 超大图放弃，避免内存爆
+        const cv = document.createElement('canvas');
+        cv.width = w; cv.height = h;
+        const cx = cv.getContext('2d', { willReadFrequently: true });
+        cx.drawImage(el, 0, 0, w, h);
+        let px;
+        try { px = cx.getImageData(0, 0, w, h).data; }
+        catch (e) { return null; } // 跨域图片画布被污染，无法取像素
+        const hist = new Uint32Array(256);
+        for (let i = 0; i < px.length; i += 4) hist[(px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) / 1000 | 0]++;
+        const thr = otsuThreshold(hist, w * h);
+        let below = 0;
+        for (let g = 0; g <= thr; g++) below += hist[g];
+        const inkIsDark = below <= w * h - below;
+        const ink = new Uint8Array(w * h);
+        const rows = new Int32Array(h);
+        const rowMax = new Int32Array(h); // 每行最长连续墨迹长度：用于识别贯穿整行的表格横线
+        for (let y = 0, p0 = 0, g0 = 0; y < h; y++) {
+            let rc = 0, run = 0, mx = 0;
+            for (let x = 0; x < w; x++, p0++, g0 += 4) {
+                const g = (px[g0] * 299 + px[g0 + 1] * 587 + px[g0 + 2] * 114) / 1000 | 0;
+                if (inkIsDark ? g <= thr : g > thr) {
+                    ink[p0] = 1; rc++; run++;
+                    if (run > mx) mx = run;
+                } else run = 0;
+            }
+            rows[y] = rc;
+            rowMax[y] = mx;
+        }
+        const meta = { w: w, h: h, ink: ink, rows: rows, rowMax: rowMax };
+        cacheSet(this.imgInk, el, meta, OCR_INK_CACHE);
+        return meta;
+    }
+
+    // 图片取词入口：光标映射到图源像素坐标 → 取景框 → 进入 0.5s 计时
+    onHoverImage(x, y) {
+        if (!this.ocrAvailable()) { this.cancelHover(); return; }
+        const src = this.ocrSourceAtPoint(x, y);
+        if (!src) { this.cancelHover(); return; }
+        const rect = src.el.getBoundingClientRect();
+        if (!rect.width || !rect.height) { this.cancelHover(); return; }
+        const ix = Math.round((x - rect.left) / rect.width * src.w);  // 光标 → 图源像素
+        const iy = Math.round((y - rect.top) / rect.height * src.h);
+        if (ix < 0 || iy < 0 || ix >= src.w || iy >= src.h) { this.cancelHover(); return; }
+        this.hoverId += 1;
+        const id = this.hoverId;
+        let ctx = null;
+        try { ctx = this.segmentImageWord(src, ix, iy); } catch (e) { /* 取像素失败：静默降级 */ }
+        if (id !== this.hoverId) return; // 鼠标已移走，结果作废
+        if (!ctx) { this.cancelHover(); return; }
+        this.onHoverImageWord(ctx);
+    }
+
+    // 取景框：Otsu 二值化定行 → 整行列投影 + 自适应词间空格定左右边界；
+    // 若边界未确定（触及搜索上限或图像边缘），把搜索范围放大 50% 重试，最多 4 次
+    segmentImageWord(src, ix, iy) {
+        const meta = this.getInkMeta(src);
+        if (!meta) return null;
+        const { w, h, ink, rows, rowMax } = meta;
+        const band = lineBand(rows, rowMax, w, h, iy);
+        if (!band) return null;
+        const charH = band.y1 - band.y0;
+        const cols = columnInk(ink, w, band.y0, band.y1);
+        clearVerticalRules(cols, ink, w, h, band.y0, band.y1); // 剔除表格竖边框，避免并入单词边界
+        // 单侧搜索上限：随字高放大，但不超过图宽——避免行高估计异常时上限失去约束
+        let capW = Math.min(w, Math.max(OCR_MAX_CROP_W, Math.round(charH * 8)));
+        let seg = null;
+        for (let i = 0; i < 4; i++) {
+            seg = wordBand(cols, w, ix, charH, capW);
+            if (!seg || !seg.clipped) break; // 边界已确定（被词间空格截断）
+            capW = Math.min(w, Math.round(capW * 1.5)); // 未能定界：搜索范围放大 50% 再试
+        }
+        if (!seg) return null;
+        // 用词的列区间重算上下边界，纳入升部/降部，避免只框住 x-height 下半部分
+        const vb = wordVerticalBand(ink, w, h, seg.x0, seg.x1, band.y0, band.y1);
+        const key = this.ocrSourceId(src.el) + '#' + regionHash(ink, w, seg.x0, vb.y0, seg.x1, vb.y1);
+        return { el: src.el, w: w, h: h, x0: seg.x0, y0: vb.y0, x1: seg.x1, y1: vb.y1, ix: ix, iy: iy, key: key };
+    }
+
+    // 同一取景框（哈希一致）不重复计时与查询
+    onHoverImageWord(ctx) {
+        if (ctx.key === this.hoverWord) return;
+        this.hoverWord = ctx.key;
+        if (this.hoverTimer) clearTimeout(this.hoverTimer);
+        this.hoverTimer = setTimeout(() => {
+            this.hoverTimer = null;
+            if (this.obSettings.hoverLookup && this.hoverWord === ctx.key) this.recognizeImageWord(ctx);
+        }, HOVER_DELAY);
+    }
+
+    // 识别取景框内的单词：命中缓存直接推送，否则裁剪放大后走系统 OCR
+    async recognizeImageWord(ctx) {
+        // 调试模式跳过结果缓存：保证每次悬浮都真实走一遍裁剪+OCR，便于观察取景框
+        const cached = this.ocrDebug ? null : this.imgWords.get(ctx.key);
+        if (cached) {
+            cacheSet(this.imgWords, ctx.key, cached, OCR_WORD_CACHE);
+            this.pushToDictView(cached);
+            return;
+        }
+        if (this.ocrBusy) { this.ocrPending = ctx; return; } // 忙：暂存，当前 OCR 结束后接着处理
+        this.ocrBusy = true;
+        this.ocrPending = null;
+        this.pushStatusToDictView('识别中'); // 悬浮命中图片：提示识别进行中
+        try {
+            const word = await this.ocrCrop(ctx);
+            if (word) {
+                this.ocrState = 'on';
+                this.ocrFail = 0;
+                cacheSet(this.imgWords, ctx.key, word, OCR_WORD_CACHE);
+                this.pushToDictView(word);
+                this.pushStatusToDictView('识别成功', 2000); // 原位提示并在 2s 后淡出
+            } else {
+                this.pushStatusToDictView('识别失败', 2000); // 未识别到词：同样反馈后淡出
+            }
+        } catch (e) {
+            console.error('词忆：图片取词 OCR 失败', e);
+            if (++this.ocrFail >= 2) this.ocrState = 'off'; // 连续失败：本次会话不再尝试
+            this.pushStatusToDictView('识别失败', 2000);
+        } finally {
+            this.ocrBusy = false;
+            const next = this.ocrPending;
+            this.ocrPending = null;
+            if (next && next.key === this.hoverWord) this.recognizeImageWord(next);
+        }
+    }
+
+    // 裁剪取景框 → 放大到目标字高 → 落临时 PNG → 系统 OCR → 取光标所在词
+    async ocrCrop(ctx) {
+        const el = ctx.el;
+        const pad = Math.max(OCR_CROP_PAD, Math.round((ctx.y1 - ctx.y0) * 0.25)); // 四周留白随字高，避免切掉升部/降部
+        const sx = Math.max(0, ctx.x0 - pad);
+        const sy = Math.max(0, ctx.y0 - pad);
+        const ex = Math.min(ctx.w, ctx.x1 + pad);
+        const ey = Math.min(ctx.h, ctx.y1 + pad);
+        const cw = ex - sx, ch = ey - sy;
+        if (cw <= 0 || ch <= 0) return '';
+        const scale = Math.max(1, Math.min(OCR_UPSCALE_MAX, Math.round(OCR_TARGET_H / ch)));
+        const cv = document.createElement('canvas');
+        cv.width = cw * scale; cv.height = ch * scale;
+        const cx = cv.getContext('2d');
+        cx.imageSmoothingEnabled = true;
+        cx.imageSmoothingQuality = 'high';
+        cx.drawImage(el, sx, sy, cw, ch, 0, 0, cv.width, cv.height);
+        if (this.ocrDebug) this.showOcrDebug(ctx, cv, sx, sy, scale); // 调试：展示实际取景框与送 OCR 的裁剪图
+        const blob = await new Promise((res) => { try { cv.toBlob(res, 'image/png'); } catch (e) { res(null); } });
+        if (!blob) return '';
+        const tmp = path.join(os.tmpdir(), 'wm-ocr-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.png');
+        fs.writeFileSync(tmp, Buffer.from(await blob.arrayBuffer()));
+        let words;
+        try {
+            words = await this.runOcr(tmp);
+        } finally {
+            try { fs.unlinkSync(tmp); } catch (e) { /* 忽略 */ }
+        }
+        // 光标在裁剪图中的位置（裁剪含留白并经过放大）
+        const word = pickOcrWord(words, (ctx.ix - sx) * scale, (ctx.iy - sy) * scale);
+        if (this.ocrDebug && this.ocrDebugInfo) { // 调试：把识别结果回填到取景框卡片
+            this.ocrDebugInfo.textContent = this.ocrDebugInfo.textContent.replace(/\s*→\s*识别：.*$/, '')
+                + '  → 识别：' + (word || '（无）');
+        }
+        return word;
+    }
+
+    // 调试用：在不遮挡阅读的前提下展示本次 OCR 的「取景框」。两处呈现：
+    // 1) 图源上叠加一个红色高亮矩形，标明取景框在图中的真实位置；
+    // 2) 右下角浮出小卡片，显示送 OCR 的放大裁剪图与坐标/字高/倍率。
+    // 均为 pointer-events:none，绝不拦截鼠标；3 秒后自动消失。
+    showOcrDebug(ctx, cv, sx, sy, scale) {
+        this.hideOcrDebug();
+        const rect = ctx.el.getBoundingClientRect();
+        if (rect.width && rect.height) {
+            // 红框与「实际送 OCR 的裁切图」完全一致（含四周 buffer）：sx/sy 为裁切起点，
+            // 裁切宽高 = cv 尺寸 / 放大倍率。鼠标落点也在框内，便于核对取景是否精准
+            const cw = cv.width / scale, ch = cv.height / scale;
+            const box = document.createElement('div');
+            box.className = 'word-memo-ocr-debug-rect';
+            box.style.left = (rect.left + sx / ctx.w * rect.width) + 'px';
+            box.style.top = (rect.top + sy / ctx.h * rect.height) + 'px';
+            box.style.width = (cw / ctx.w * rect.width) + 'px';
+            box.style.height = (ch / ctx.h * rect.height) + 'px';
+            document.body.appendChild(box);
+            this.ocrDebugRect = box;
+        }
+        const panel = document.createElement('div');
+        panel.className = 'word-memo-ocr-debug';
+        const title = document.createElement('div');
+        title.className = 'word-memo-ocr-debug-title';
+        title.textContent = 'OCR 裁切';
+        panel.appendChild(title);
+        // 裁切图按最大 300px 宽等比缩略展示（实际送 OCR 的是 cv 全尺寸）。
+        // 高亮矩形已由 DOM 叠加层标出「取景框」，此处专门显示「实际送 OCR 的裁切图」，
+        // 并标出鼠标落点，便于核对裁切位置是否正确
+        const maxW = 300, maxH = 90;
+        const k = Math.min(maxW / cv.width, maxH / cv.height, 1);
+        const thumb = document.createElement('canvas');
+        thumb.width = Math.max(1, Math.round(cv.width * k));
+        thumb.height = Math.max(1, Math.round(cv.height * k));
+        const tctx = thumb.getContext('2d');
+        tctx.fillStyle = '#fff';
+        tctx.fillRect(0, 0, thumb.width, thumb.height);
+        tctx.drawImage(cv, 0, 0, thumb.width, thumb.height);
+        // 鼠标落点：裁切图内光标像素 × 缩略比例
+        const hx = (ctx.ix - sx) * scale * k, hy = (ctx.iy - sy) * scale * k;
+        tctx.strokeStyle = '#000'; tctx.lineWidth = 3;
+        tctx.beginPath(); tctx.moveTo(hx, 0); tctx.lineTo(hx, thumb.height); tctx.moveTo(0, hy); tctx.lineTo(thumb.width, hy); tctx.stroke();
+        tctx.strokeStyle = '#ff2d55'; tctx.lineWidth = 1;
+        tctx.beginPath(); tctx.moveTo(hx, 0); tctx.lineTo(hx, thumb.height); tctx.moveTo(0, hy); tctx.lineTo(thumb.width, hy); tctx.stroke();
+        panel.appendChild(thumb);
+        const info = document.createElement('div');
+        info.className = 'word-memo-ocr-debug-info';
+        info.textContent = '原图 ' + ctx.w + '×' + ctx.h + '  取景 [' + ctx.x0 + ',' + ctx.y0 + ' → ' + ctx.x1 + ',' + ctx.y1 + ']  '
+            + '裁切 ' + cv.width + '×' + cv.height + '（' + scale + '×）  字高 ' + (ctx.y1 - ctx.y0);
+        panel.appendChild(info);
+        document.body.appendChild(panel);
+        this.ocrDebugInfo = info;
+        // 兜底：面板若因主题/层级未显示，可在控制台看到同一份取景/裁切数据
+        console.log('[词忆OCR 取景与裁切]', info.textContent, ' 鼠标落点(裁切图内)=' + Math.round((ctx.ix - sx) * scale) + ',' + Math.round((ctx.iy - sy) * scale));
+        this.ocrDebugBox = panel;
+        this.ocrDebugTimer = setTimeout(() => this.hideOcrDebug(), 3000);
+    }
+
+    hideOcrDebug() {
+        if (this.ocrDebugTimer) { clearTimeout(this.ocrDebugTimer); this.ocrDebugTimer = null; }
+        if (this.ocrDebugRect) { this.ocrDebugRect.remove(); this.ocrDebugRect = null; }
+        if (this.ocrDebugBox) { this.ocrDebugBox.remove(); this.ocrDebugBox = null; }
+        this.ocrDebugInfo = null;
+    }
+
+    // 调用 Windows 系统 OCR：spawn powershell.exe 执行内联脚本，图片路径经环境变量传入
+    runOcr(imgPath) {
+        return new Promise((resolve, reject) => {
+            execFile('powershell.exe',
+                ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', ocrEncodedCommand()],
+                {
+                    windowsHide: true,
+                    timeout: 15000,
+                    maxBuffer: 16 * 1024 * 1024,
+                    env: Object.assign({}, process.env, { WM_OCR_IMG: imgPath })
+                },
+                (err, stdout) => {
+                    if (err) { reject(err); return; }
+                    const text = String(stdout || '').replace(/^\uFEFF/, '').trim();
+                    if (!text) { resolve([]); return; }
+                    try {
+                        const j = JSON.parse(text);
+                        resolve(Array.isArray(j) ? j : [j]);
+                    } catch (e) { reject(e); }
+                });
+        });
+    }
+
+    // 持久化插件设置（宿主功能开关 / 取景框调试）
+    async persistLocalSettings() {
+        const saved = (await this.loadData()) || {};
+        await this.saveData(Object.assign({}, saved, { obSettings: this.obSettings, ocrDebug: this.ocrDebug }));
+    }
+
+
+    // PDF 划词查询：内置 PDF 查看器不触发 editor-menu 事件，故自绘两个入口
+    // 入口一：选中文本后在选区旁浮出「查」按钮；入口二：把「查询」追加进 PDF 右键菜单
     initPdfSelection() {
         const btn = document.body.createDiv({ cls: 'word-memo-pdf-translate-btn' });
         btn.innerHTML = SEARCH_ICON_INLINE_SVG;
-        btn.setAttribute('aria-label', '翻译（词忆）');
+        btn.setAttribute('aria-label', '查询（词忆）');
         btn.style.display = 'none';
         this.pdfBtn = btn;
         btn.addEventListener('mousedown', (e) => e.preventDefault()); // 避免按下时清除选区
@@ -1183,6 +1851,17 @@ module.exports = class WordMemoPlugin extends Plugin {
         });
     }
 
+    // 推送侧栏状态提示（如「识别中」）。text 为空表示收起提示；
+    // autoHideMs > 0 表示短暂提示（如「识别成功/失败」）在该毫秒数后自动淡出
+    pushStatusToDictView(text, autoHideMs) {
+        const leaves = this.app.workspace.getLeavesOfType(DICT_VIEW_TYPE);
+        if (!leaves.length) return;
+        leaves.forEach((leaf) => {
+            const view = leaf.view;
+            if (view && typeof view.postToFrame === 'function') view.postToFrame({ type: 'wm-dict-status', text: text || '', autoHide: autoHideMs || 0 });
+        });
+    }
+
     // 后台启动内置静态服务（自动，无需用户手动执行任何命令）
     async startServer() {
         try {
@@ -1222,6 +1901,9 @@ module.exports = class WordMemoPlugin extends Plugin {
 
     onunload() {
         this.cancelHover(); // 清理悬浮取词计时
+        this.hideOcrDebug(); // 移除调试取景框叠加层
+        if (this.imgInk) this.imgInk.clear(); // 释放墨迹图 / 取景框词缓存
+        if (this.imgWords) this.imgWords.clear();
         if (this.pdfBtn) { this.pdfBtn.remove(); this.pdfBtn = null; } // 移除 PDF 划词浮出按钮
         if (this.server) {
             this.server.stop();
@@ -1288,7 +1970,7 @@ module.exports = class WordMemoPlugin extends Plugin {
         });
     }
 
-    // 划词翻译：编辑器选中的文本交给右侧栏承接（单词 → 首选词典释义，句子 → AI 翻译）
+    // 划词查询：编辑器选中的文本交给右侧栏承接（单词 → 首选词典释义，句子/中文 → AI 查询：翻译并解读）
     translateSelection(text) {
         const t = String(text || '').trim();
         if (!t) return;
