@@ -519,6 +519,16 @@ function regionHash(ink, w, x0, y0, x1, y1) {
     return bits;
 }
 
+// 读取 dataURL / 图片地址为可绘制的 Image：供应用内图片取词复用同一套取景与 OCR
+function loadImageEl(src) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('image load failed'));
+        img.src = src;
+    });
+}
+
 // 归一化 OCR 结果：只保留英文单词本体（去首尾标点，允许词内连字符/撇号）
 function normalizeOcrWord(s) {
     const t = String(s || '').replace(/^[^A-Za-z]+/, '').replace(/[^A-Za-z'’-]+$/, '')
@@ -1327,8 +1337,23 @@ module.exports = class WordMemoPlugin extends Plugin {
             });
             if (!fromHost) return;
             if (d.type === 'wm-dict-lookup' && d.word) {
-                // 「查看词典详情」：转交右侧栏查词视图承接，主页不弹结果窗口
-                this.lookupInDictView(String(d.word));
+                // 「查看词典详情」：转交右侧栏查词视图承接，主页不弹结果窗口。
+                // keepFocus=true（记得么「如何记忆」辅助展示）时不抢焦点，避免把焦点从主页
+                // iframe 抢到侧栏后，网页内快捷键（如再次触发的热键）收不到按键
+                this.lookupInDictView(String(d.word), !!d.keepFocus);
+            } else if (d.type === 'wm-ocr-hover' && d.dataUrl) {
+                // 应用内（iframe）图片取词：宿主文档的 mousemove 到不了 iframe 内部，
+                // 故由页面自行取景并把整图与光标坐标发来，这里复用同一套取景 + 系统 OCR
+                this.ocrFromApp(String(d.dataUrl), Number(d.ix) || 0, Number(d.iy) || 0);
+            } else if (d.type === 'wm-dict-note' && d.word) {
+                // 「我的笔记」外部写入：仅推给「已经打开」的右侧栏查词视图，令其刷新当前词条
+                // 笔记区与日期。刻意不做 activateDictView——仅仅更新一条笔记不该把侧栏唤起/抢焦点
+                this.app.workspace.getLeavesOfType(DICT_VIEW_TYPE).forEach((leaf) => {
+                    const view = leaf.view;
+                    if (view && typeof view.postToFrame === 'function') {
+                        view.postToFrame({ type: 'wm-dict-note', word: d.word, note: d.note, ts: d.ts });
+                    }
+                });
             }
         });
     }
@@ -1572,6 +1597,39 @@ module.exports = class WordMemoPlugin extends Plugin {
             const next = this.ocrPending;
             this.ocrPending = null;
             if (next && next.key === this.hoverWord) this.recognizeImageWord(next);
+        }
+    }
+
+    // 应用内（iframe）图片取词：页面把整图 dataURL 与光标像素坐标发来，
+    // 这里解码为 Image 后复用同一套取景（segmentImageWord）与系统 OCR（ocrCrop），
+    // 命中则把单词交右侧栏查词视图承接（keepFocus，不抢走应用内焦点）
+    async ocrFromApp(dataUrl, ix, iy) {
+        if (!this.ocrAvailable()) return;
+        if (this.ocrBusy) { this.ocrPendingApp = { dataUrl, ix, iy }; return; } // 忙：暂存最后一次
+        this.ocrBusy = true;
+        this.ocrPendingApp = null;
+        this.pushStatusToDictView('识别中');
+        try {
+            const img = await loadImageEl(dataUrl);
+            const src = { el: img, w: img.naturalWidth || img.width, h: img.naturalHeight || img.height };
+            const ctx = src.w && src.h ? this.segmentImageWord(src, ix, iy) : null;
+            const word = ctx ? await this.ocrCrop(ctx) : '';
+            if (word) {
+                this.ocrState = 'on';
+                this.ocrFail = 0;
+                this.pushStatusToDictView('识别成功', 2000);
+                this.lookupInDictView(word, true);
+            } else {
+                this.pushStatusToDictView('识别失败', 2000);
+            }
+        } catch (e) {
+            if (++this.ocrFail >= 2) this.ocrState = 'off'; // 连续失败：本次会话不再尝试
+            this.pushStatusToDictView('识别失败', 2000);
+        } finally {
+            this.ocrBusy = false;
+            const next = this.ocrPendingApp;
+            this.ocrPendingApp = null;
+            if (next) this.ocrFromApp(next.dataUrl, next.ix, next.iy);
         }
     }
 
@@ -1922,24 +1980,24 @@ module.exports = class WordMemoPlugin extends Plugin {
         workspace.revealLeaf(leaf);
     }
 
-    // 在右侧栏打开查单词视图（已存在则复用并展开）
-    async activateDictView() {
+    // 在右侧栏打开查单词视图（已存在则复用并展开）。
+    // keepFocus=true 时不把侧栏激活/聚焦，仅展开并展示内容，保持主页 iframe 焦点不被抢走
+    async activateDictView(keepFocus) {
         const { workspace } = this.app;
-        // 首选官方 ensureSideLeaf：保证视图落在右侧栏、并同时展开侧栏与聚焦该标签。
-        // 仅用 getRightLeaf(false) 时，侧栏处于折叠态不会自动展开，且拿不到侧栏叶子时会
-        // 静默退到主区域，表现为「点了图标右侧却不出现」。
+        // 首选官方 ensureSideLeaf：保证视图落在右侧栏、并同时展开侧栏。
+        // active 决定是否聚焦该标签：keepFocus 时传 false，避免抢走主页 iframe 的焦点
         if (typeof workspace.ensureSideLeaf === 'function') {
-            const leaf = await workspace.ensureSideLeaf(DICT_VIEW_TYPE, 'right', { active: true, reveal: true });
+            const leaf = await workspace.ensureSideLeaf(DICT_VIEW_TYPE, 'right', { active: !keepFocus, reveal: true });
             if (leaf) return;
         }
         // 回退（旧版 Obsidian 无 ensureSideLeaf）：沿用原逻辑，并显式展开折叠的右侧栏
         let leaf = workspace.getLeavesOfType(DICT_VIEW_TYPE)[0];
         if (!leaf) {
             leaf = workspace.getRightLeaf(false) || workspace.getLeaf('tab');
-            await leaf.setViewState({ type: DICT_VIEW_TYPE, active: true });
+            await leaf.setViewState({ type: DICT_VIEW_TYPE, active: !keepFocus });
         }
         if (workspace.rightSplit && workspace.rightSplit.collapsed) workspace.rightSplit.expand();
-        workspace.revealLeaf(leaf);
+        if (!keepFocus) workspace.revealLeaf(leaf);
     }
 
     // 打开封面视窗（已存在则复用并展开）：供其它可视化插件内嵌
@@ -1955,15 +2013,15 @@ module.exports = class WordMemoPlugin extends Plugin {
 
     // 把主页发来的单词交给右侧栏查词视图：先确保侧栏已展开，再把单词推入其 iframe。
     // 侧栏刚创建时 iframe 尚未加载完成，消息由视图排队、load 后补发
-    async lookupInDictView(word) {
+    async lookupInDictView(word, keepFocus) {
         if (!word) return;
-        await this.sendToDictView({ type: 'wm-dict-word', word: word });
+        await this.sendToDictView({ type: 'wm-dict-word', word: word }, keepFocus);
     }
 
     // 把消息交给右侧栏查词视图：先确保侧栏已展开，再推入其 iframe。
     // 侧栏刚创建时 iframe 尚未加载完成，消息由视图排队、load 后补发
-    async sendToDictView(msg) {
-        await this.activateDictView();
+    async sendToDictView(msg, keepFocus) {
+        await this.activateDictView(keepFocus);
         this.app.workspace.getLeavesOfType(DICT_VIEW_TYPE).forEach((leaf) => {
             const view = leaf.view;
             if (view && typeof view.postToFrame === 'function') view.postToFrame(msg);
