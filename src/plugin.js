@@ -1133,6 +1133,7 @@ class WordMemoSettingTab extends PluginSettingTab {
         this.renderBack(containerEl);
         // 不设顶层标题（尤其不使用插件名）；分区头在各分区内呈现
         this.section(containerEl, '取词', '文本层直接取词；图片则用系统 OCR 识别光标下的单词。', (body) => this.lookupSection(body));
+        this.section(containerEl, '背单词模式', '练习时右侧栏单词详情的显示时机，辅助巩固错词或复核记忆。', (body) => this.practiceSection(body));
         this.section(containerEl, null, null, (body) => this.aboutSection(body));
     }
 
@@ -1196,6 +1197,34 @@ class WordMemoSettingTab extends PluginSettingTab {
             }));
     }
 
+    // 背单词模式分区：练习作答时右侧栏查词的显示时机
+    practiceSection(body) {
+        // 逐项换行说明（setDesc 传 \n 不会换行，这里用 DocumentFragment 结构化呈现）
+        const desc = document.createDocumentFragment();
+        [
+            ['均不显示', '无论答对答错都不显示单词查词详情，适合速刷。'],
+            ['答错显示', '点击「不知道 / 不记得」时才显示右侧单词详情，便于巩固错词。'],
+            ['答对答错均显示', '点击任何选项均显示右侧单词详情，便于复核记忆。']
+        ].forEach(([term, text]) => {
+            const line = desc.createEl('div', { cls: 'wm-answer-lookup-line' });
+            line.createEl('strong', { text: term + '：' });
+            line.appendText(text);
+        });
+        new Setting(body)
+            .setName('右侧查词')
+            .setDesc(desc)
+            .addDropdown((dd) => dd
+                .addOption('none', '均不显示')
+                .addOption('wrong', '答错显示')
+                .addOption('all', '答对答错均显示')
+                .setValue(this.plugin.obSettings.answerLookup || 'wrong')
+                .onChange(async (v) => {
+                    this.plugin.obSettings.answerLookup = v;
+                    await this.plugin.persistLocalSettings();
+                    this.plugin.pushSettingsToAllFrames();
+                }));
+    }
+
     aboutSection(body) {
         const manifest = this.plugin.manifest;
         new Setting(body)
@@ -1232,7 +1261,7 @@ module.exports = class WordMemoPlugin extends Plugin {
 
         // 宿主侧功能开关：悬浮取词（文本 + 图片 OCR）/ 划词查询 / 右侧窗口查词。
         // 均在插件设置页维护，持久化到插件数据；右侧窗口查词另注入 iframe 供页面使用
-        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true };
+        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true, answerLookup: 'wrong' };
         this.hoverWord = ''; // 当前悬浮所在单词（同一单词不重复查询、不重置计时）
         this.hoverTimer = null;
         this.hoverTick = 0; // 取词节流时间戳
@@ -1364,7 +1393,8 @@ module.exports = class WordMemoPlugin extends Plugin {
             type: 'wm-ob-settings',
             hoverLookup: this.obSettings.hoverLookup !== false,
             selectionTranslate: this.obSettings.selectionTranslate !== false,
-            dictLookupInSidebar: this.obSettings.dictLookupInSidebar !== false
+            dictLookupInSidebar: this.obSettings.dictLookupInSidebar !== false,
+            answerLookup: this.obSettings.answerLookup || 'wrong'
         });
     }
 
