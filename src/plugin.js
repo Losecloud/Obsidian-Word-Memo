@@ -900,6 +900,17 @@ class StaticServer {
             return;
         }
 
+        // 词典清单：/dict-list.json 仅 serve.js 提供（其依赖实时扫描磁盘）。插件端无该能力，
+        // 返回空清单（而非 404），查词引擎据此回退读取 data/dict-manifest.js，同时避免控制台报错
+        if (pathname === '/dict-list.json') {
+            res.writeHead(200, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': 'no-store'
+            });
+            res.end('[]');
+            return;
+        }
+
         if (pathname === '/') pathname = '/' + ENTRY_FILE;
 
         const filePath = path.resolve(this.root, '.' + pathname);

@@ -10,7 +10,7 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-![词忆](https://raw.githubusercontent.com/Losecloud/reciting/main/static/cover/%E9%98%85%E8%AF%BB%E8%81%94%E6%83%B3%E8%AE%B0%E5%BF%86.png)
+![词忆](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/cover/%E9%98%85%E8%AF%BB%E8%81%94%E6%83%B3%E8%AE%B0%E5%BF%86.png)
 
 </div>
 
@@ -56,9 +56,9 @@
 **蒲公英聚类**把词按词义一级分类聚成花冠外圈，种子大小取 CEFR 词频，正确率 ≤ 50% 的重点难词自动标红；切换「忘记词」口径，待复习的词即从花头飘向空中——花头留下的是已掌握，飘着的就是要复习的，还可直接拖拽整理清单。
 **混沌星云**以无散度流场驱动上万粒子，点选任一词即以贝塞尔曲线连出最强关联（词根、形近可跨星团）并标注关系依据。难词由此不再是散点，而是一张有优先级、有联想路径的网。
 
-![蒲公英聚类](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E8%92%B2%E5%85%AC%E8%8B%B1%E8%81%9A%E7%B1%BB.png)
+![蒲公英聚类](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/md-image/%E8%92%B2%E5%85%AC%E8%8B%B1%E8%81%9A%E7%B1%BB.png)
 
-![混沌星云](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E6%B7%B7%E6%B2%8C%E6%98%9F%E4%BA%91.png)
+![混沌星云](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/md-image/%E6%B7%B7%E6%B2%8C%E6%98%9F%E4%BA%91.png)
 
 ### 2️⃣ 智能导入生词清单 × 五种学习模式 × SM-2 智能复习
 
@@ -66,7 +66,7 @@
 
 支持 TXT / CSV / Excel / DOCX 导入并自动识别表结构，缺音标释义时先正则提取单词立即入库、再由 AI 后台补齐。五种模式可选——看单词选释义、看释义拼单词、记得么、同义替换、熟词僻义，由「认得出」递进到「分得清」。复习交给跟随艾宾浩斯曲线的 SM-2 自动排程，配合弱点自查定位最该补的词；也可接入任意 OpenAI 兼容 API 辅助记忆。
 
-![学习模式与复习](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E5%AD%A6%E4%B9%A0%E6%A8%A1%E5%BC%8F%E4%B8%8E%E5%A4%8D%E4%B9%A0.png)
+![学习模式与复习](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/md-image/%E5%AD%A6%E4%B9%A0%E6%A8%A1%E5%BC%8F%E4%B8%8E%E5%A4%8D%E4%B9%A0.png)
 
 ### 3️⃣ 130K+ CEFR 分级词汇 × 社区词典工坊 × 自带词典导入
 
@@ -76,7 +76,7 @@
 
 同时支持导入你自己的 **MDX / JSON / JS 词典**（含配套 MDD 样式与真人发音），详见下方「词典数据」。
 
-![词典工坊](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E8%AF%8D%E5%85%B8%E5%B7%A5%E5%9D%8A.png)
+![词典工坊](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/md-image/%E8%AF%8D%E5%85%B8%E5%B7%A5%E5%9D%8A.png)
 
 ### 4️⃣ 英文学习插件共创生态
 
@@ -90,7 +90,7 @@
 - **微信读书划线导出** — 把阅读中的划线与想法导出为 Markdown，或直接提取成词书
 - **文字游戏** — 沉浸式剧情（恐怖 / 科幻 / 恋爱）中记单词
 
-![插件共创生态](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E6%8F%92%E4%BB%B6%E5%85%B1%E5%88%9B%E7%94%9F%E6%80%81.png)
+![插件共创生态](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/md-image/%E6%8F%92%E4%BB%B6%E5%85%B1%E5%88%9B%E7%94%9F%E6%80%81.png)
 
 ### 5️⃣ 一键收藏进欧路词典
 
@@ -98,7 +98,7 @@
 
 把词单与你的**欧路生词本**链接起来，之后每次收藏都自动、静默地增量推送到欧路——在笔记里看到的词，手机上打开欧路就能复习，两套工具的数据从此是一条线。
 
-![欧路词典联动](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E6%AC%A7%E8%B7%AF%E8%AF%8D%E5%85%B8%E8%81%94%E5%8A%A8.png)
+![欧路词典联动](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/md-image/%E6%AC%A7%E8%B7%AF%E8%AF%8D%E5%85%B8%E8%81%94%E5%8A%A8.png)
 
 ## 📖 词典数据
 
@@ -165,8 +165,8 @@ python tools/web2ob.py                     # 打包应用内核（不内嵌任�
 ## 💬 联系与支持
 
 - 问题反馈：[GitHub Issues](https://github.com/Losecloud/Obsidian-Word-Memo/issues)
-- 功能建议：[GitHub Discussions](https://github.com/Losecloud/VocRec/discussions)
-- 主项目：[https://github.com/Losecloud/reciting](https://github.com/Losecloud/reciting)
+- 功能建议：[GitHub Discussions](https://github.com/Losecloud/Word-Memo/discussions)
+- 主项目：[https://github.com/Losecloud/Word-Memo](https://github.com/Losecloud/Word-Memo)
 
 ## 📄 许可
 
@@ -201,4 +201,4 @@ Made with ❤️ by [Losecloud]
 
 </div>
 
-![词忆 · Obsidian 单词记忆插件](https://raw.githubusercontent.com/Losecloud/reciting/main/static/md-image/%E6%96%87%E6%A1%A3%E5%B0%81%E5%BA%95.png)
+![词忆 · Obsidian 单词记忆插件](https://raw.githubusercontent.com/Losecloud/Word-Memo/main/static/md-image/%E6%96%87%E6%A1%A3%E5%B0%81%E5%BA%95.png)
