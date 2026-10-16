@@ -1,0 +1,1 @@
+0.2.6 插件：移动端启动链路根治（不再无条件调 getBasePath 致解压静默中止、去 Node Buffer 改用 DataView 解析、写入改走 vault 相对路径并逐级 mkdir；附加载看门狗让白屏可见）

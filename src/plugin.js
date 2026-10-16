@@ -567,12 +567,15 @@ function pickOcrWord(words, px, py) {
 // adapter：vault.adapter 实例（Obsidian 跨平台 API）。桌面端可传 null，内部用 Node fs；移动端必须传
 async function extractAppBundle(vaultBase, adapter) {
     if (typeof WM_APP_BUNDLE !== 'string' || !WM_APP_BUNDLE) return null;
-    const target = path ? path.join(vaultBase, APP_DIR) : vaultBase + '/' + APP_DIR;
-    const marker = path ? path.join(target, '.wm-version') : target + '/.wm-version';
+    // 桌面端：vaultBase 为绝对路径，用 path.join 得绝对目录（写入走 Node fs）
+    // 移动端：vault.adapter 只接受 vault 相对路径（且无 getBasePath），target 直接用相对目录名
+    const hasPath = !!path;
+    const target = hasPath ? path.join(vaultBase, APP_DIR) : APP_DIR;
+    const marker = hasPath ? path.join(target, '.wm-version') : target + '/.wm-version';
     // 记录上一版包解压出的文件清单（相对路径，一行一个）。包结构改动后据此删掉
     // 「旧版有、新版无」的残留：否则旧文件会永久留在 vault 里，旧词典还会被下面的
     // 「保留用户词典」逻辑重新注册回 dict-manifest，等于没瘦身。只记包管文件，不碰用户数据
-    const filesMarker = path ? path.join(target, '.wm-files') : target + '/.wm-files';
+    const filesMarker = hasPath ? path.join(target, '.wm-files') : target + '/.wm-files';
     // 指纹 = 版本号 + 包内容哈希：只要应用包变了就必须重新解压，
     // 否则开发期改了应用文件、版本号没动，vault 里会一直跑旧副本
     // WM_APP_STAMP 在 web2ob.py 构建时算好，宿主无需 crypto 模块（移动端无 Node crypto）
@@ -584,16 +587,18 @@ async function extractAppBundle(vaultBase, adapter) {
     } catch (e) { /* 读取失败则重新解压 */ }
 
     const raw = await decompressBundle(WM_APP_BUNDLE);
-    if (raw.slice(0, 4).toString('ascii') !== 'WMB1') throw new Error('内嵌应用包格式不正确');
-
+    // 统一按 Uint8Array 解析：桌面端 Buffer 是其子类，移动端无 Node Buffer（不能调 readUInt32BE）
+    if (raw[0] !== 0x57 || raw[1] !== 0x4D || raw[2] !== 0x42 || raw[3] !== 0x31) throw new Error('内嵌应用包格式不正确');
+    const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const decoder = new TextDecoder('utf-8');
     let off = 4;
-    const count = raw.readUInt32BE(off); off += 4;
+    const count = view.getUint32(off); off += 4;
     const written = new Set();
     for (let i = 0; i < count; i++) {
-        const nameLen = raw.readUInt16BE(off); off += 2;
-        const name = raw.slice(off, off + nameLen).toString('utf8'); off += nameLen;
-        const size = raw.readUInt32BE(off); off += 4;
-        const content = raw.slice(off, off + size); off += size;
+        const nameLen = view.getUint16(off); off += 2;
+        const name = decoder.decode(raw.subarray(off, off + nameLen)); off += nameLen;
+        const size = view.getUint32(off); off += 4;
+        const content = raw.subarray(off, off + size); off += size;
 
         await writeEntry(target, name, content, adapter);
         written.add(name);
@@ -636,23 +641,39 @@ async function decompressBundle(b64) {
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    // iOS 16.4+ / 现代 WebView 才有原生 DecompressionStream；缺失时给出可定位的提示
+    if (typeof DecompressionStream === 'undefined') {
+        throw new Error('当前 WebView 不支持原生 gzip 解压（iOS 需 16.4 及以上），请升级系统后重试');
+    }
     const stream = new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')));
     const ab = await stream.arrayBuffer();
-    return Buffer.from(ab);
+    return new Uint8Array(ab);
 }
 
 // 写入条目：桌面 fs.writeFileSync；移动端 vault.adapter.writeBinary
 async function writeEntry(target, name, content, adapter) {
     const filePath = target + '/' + name;
     if (fs) {
-        if (!filePath.startsWith(target + path.sep) && filePath !== target) return; // 防目录穿越
+        // 防目录穿越：filePath 用 '/' 拼接，而 Windows 下 target 由 path.join 得到 '\' 分隔，
+        // 故两种分隔符都要判（旧代码只判 path.sep，导致 Windows 桌面端整包被误拦、写不进去）
+        const inside = filePath.startsWith(target + '/') || filePath.startsWith(target + path.sep);
+        if (!inside && filePath !== target) return;
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
         fs.writeFileSync(filePath, content);
         return;
     }
-    // 移动端：vault.adapter.writeBinary，自动建父目录；不需 mkdir
+    // 移动端：vault.adapter.writeBinary 不保证自动建父目录，故先按路径段逐级 mkdir
     if (!filePath.startsWith(target + '/')) return; // 防目录穿越
     if (!adapter) throw new Error('移动端必须传入 vault.adapter');
+    const dir = filePath.slice(0, filePath.lastIndexOf('/'));
+    if (dir && typeof adapter.mkdir === 'function') {
+        let cur = '';
+        for (const part of dir.split('/')) {
+            if (!part) continue;
+            cur = cur ? cur + '/' + part : part;
+            try { await adapter.mkdir(cur); } catch (e) { /* 已存在：忽略；其余错误交给写入阶段暴露 */ }
+        }
+    }
     await adapter.writeBinary(filePath, content instanceof Uint8Array ? content : new Uint8Array(content));
 }
 
@@ -1069,6 +1090,8 @@ class FrameView extends ItemView {
         this.frame = null;
         this.loaded = false; // iframe 文档是否已加载完成（未完成时 postMessage 会丢，需排队）
         this.pending = []; // iframe 未就绪时排队的消息，load 后补发
+        this.loadTimer = null; // 加载看门狗计时器
+        this.hintEl = null; // iframe 上方的诊断提示条
     }
 
     getIcon() {
@@ -1084,10 +1107,15 @@ class FrameView extends ItemView {
         // 主题实时同步：iframe 加载完成后推送一次，并在 Obsidian 主题变化时持续推送
         this.frame.addEventListener('load', () => {
             this.loaded = true;
+            this.clearFrameHint(); // 已加载成功：撤掉看门狗提示
             this.pushTheme();
             // 宿主功能开关随主题一并注入（页面据此决定查词跳转等行为）
             if (typeof this.plugin.pushSettingsToFrame === 'function') this.plugin.pushSettingsToFrame(this);
             this.flushPending();
+        });
+        // 资源被拦时（如 iOS WebView 的 CSP 拒绝 app:// 下的脚本/样式）给出可定位提示
+        this.frame.addEventListener('error', () => {
+            this.showFrameHint('页面资源加载失败：可能是 iOS 限制了 iframe 的 app:// 资源访问（CSP），或解码目录缺失');
         });
         this.observer = new MutationObserver(() => this.pushTheme());
         const obsOpts = { attributes: true, attributeFilter: ['class'] };
@@ -1114,7 +1142,7 @@ class FrameView extends ItemView {
                 try { if (await adapter.exists(p)) { found = p; break; } } catch (e) { /* 忽略 */ }
             }
             if (!found) return null;
-            src = adapter.getResourcePath(found);
+            try { src = adapter.getResourcePath(found); } catch (e) { return null; } // 适配器不支持资源路径时按未就绪处理
         }
 
         // 附加查询参数：视图模式 + 宿主主题（主题随参数带入，避免首屏闪烁）+ 宿主标识
@@ -1150,6 +1178,7 @@ class FrameView extends ItemView {
             // 兜底：同步路径再试一次（resolveSrc 失败但 vault 索引可能已刷新）
             const syncSrc = this.resolveSrcSync();
             if (syncSrc) {
+                this.startLoadWatch();
                 this.frame.src = syncSrc;
                 return;
             }
@@ -1161,14 +1190,17 @@ class FrameView extends ItemView {
                 return;
             }
             this.contentEl.empty();
+            const err = this.plugin && this.plugin.extractError;
+            const reason = err ? `；应用包解压失败：${err.message || err}` : '';
             this.contentEl.createEl('div', {
-                text: `未找到入口文件：${ENTRY_FILE}（请确认它位于 vault 根目录或 ${APP_DIR}/）`
+                text: `未找到入口文件：${ENTRY_FILE}（请确认它位于 vault 根目录或 ${APP_DIR}/）${reason}`
             });
-            new Notice('词忆：未找到入口文件 ' + ENTRY_FILE);
+            new Notice('词忆：未找到入口文件 ' + ENTRY_FILE + reason);
             return;
         }
         if (this.frame.src === src) return;
         this.loaded = false; // 重新加载：等待新的 load 事件
+        this.startLoadWatch();
         this.frame.src = src;
     }
 
@@ -1203,7 +1235,36 @@ class FrameView extends ItemView {
         msgs.forEach((m) => this.postToFrame(m));
     }
 
+    // 加载看门狗：设好 src 后若长时间不触发 load，多半是资源被 iOS WebView 拦下或解码目录缺失，
+    // 主动给出提示，避免只看到一片空白却无从定位（此前这类失败是完全静默的）
+    startLoadWatch() {
+        if (this.loadTimer) clearTimeout(this.loadTimer);
+        this.loadTimer = setTimeout(() => {
+            if (!this.loaded) {
+                this.showFrameHint('页面 10 秒内未加载完成：可能是 iOS 未放行 iframe 的 app:// 资源访问（CSP），或 .word-memo/ 解码目录缺失');
+            }
+        }, 10000);
+    }
+
+    // 在 iframe 上方挂一条提示条（不遮挡页面）；重复调用只更新文本。用宿主主题变量着色
+    showFrameHint(text) {
+        if (!this.hintEl || !this.hintEl.isConnected) {
+            this.hintEl = this.contentEl.createEl('div');
+            this.hintEl.style.cssText = 'flex:0 0 auto;padding:6px 10px;font-size:12px;line-height:1.4;'
+                + 'color:var(--text-warning);background:var(--background-secondary);'
+                + 'border-bottom:1px solid var(--background-modifier-border);word-break:break-word;';
+            this.contentEl.insertBefore(this.hintEl, this.frame);
+        }
+        this.hintEl.setText(text);
+    }
+
+    clearFrameHint() {
+        if (this.loadTimer) { clearTimeout(this.loadTimer); this.loadTimer = null; }
+        if (this.hintEl) { this.hintEl.remove(); this.hintEl = null; }
+    }
+
     async onClose() {
+        this.clearFrameHint();
         if (this.observer) {
             this.observer.disconnect();
             this.observer = null;
@@ -2170,13 +2231,16 @@ module.exports = class WordMemoPlugin extends Plugin {
         try {
             const saved = (await this.loadData()) || {};
             const adapter = this.app.vault.adapter;
-            const vaultBase = adapter.getBasePath();
+            // 移动端适配器（Capacitor）没有 getBasePath 方法，此时解压改走 vault 相对路径，无需绝对根
+            const vaultBase = (typeof adapter.getBasePath === 'function') ? adapter.getBasePath() : null;
             // 发行版：解压内嵌应用包，以其目录为服务根；开发态（无内嵌包）：回退到 vault 根目录
             let root = vaultBase;
             try {
                 const extracted = await extractAppBundle(vaultBase, adapter);
                 if (extracted) root = extracted;
+                this.extractError = null;
             } catch (e) {
+                this.extractError = e; // 记下真实原因，供「未找到入口文件」提示带出（此前仅写 console 难排查）
                 console.error('词忆：解压内嵌应用包失败，回退到 vault 根目录', e);
             }
             if (!IS_DESKTOP) {
