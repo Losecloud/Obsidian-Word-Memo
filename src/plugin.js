@@ -78,8 +78,21 @@ function ocrEncodedCommand() {
 }
 // 内部桥接接口前缀（供页面读写 user/ 目录）
 const BRIDGE_PREFIX = '/__wm__/';
-// 用户配置目录（相对 vault 根目录）
-const USER_DIR = 'user';
+// 用户配置目录（相对 vault 根目录）。必须落在 vault 根下的普通目录，才能被 Obsidian Sync 同步：
+// Sync 不同步以「.」开头的目录（.obsidian 除外），而旧版把它写在 .word-memo/user/ 里，配置因此上不了云
+const DEFAULT_USER_DIR = 'user';
+
+// 规范化用户配置目录：统一分隔符、去掉首尾斜杠、拒绝越级与绝对路径，非法值回落默认
+function normalizeUserDir(value) {
+    const parts = String(value == null ? '' : value).trim().replace(/\\/g, '/')
+        .split('/').filter((p) => p && p !== '.');
+    // 拒绝越级（..），以及路径段中 Windows 不允许的字符（含盘符冒号）与结尾的点/空格
+    if (!parts.length
+        || parts.some((p) => p === '..' || /[<>:"|?*\u0000-\u001f]/.test(p) || /[. ]$/.test(p))) {
+        return DEFAULT_USER_DIR;
+    }
+    return parts.join('/');
+}
 // 「查单词（词忆）」统一图标：static/image/search.svg 的内联副本。
 // addIcon 要求传入「不含 <svg> 外层标签」的内容，且内容须落在 0 0 100 100 视图框内，
 // 故用 <g transform> 把原图 80.14 的坐标系等比缩放到 100。fill 取 currentColor 以适配深浅主题，
@@ -688,6 +701,29 @@ async function removeEntry(target, name, adapter) {
     try { await adapter.remove(filePath); } catch (e) { /* 忽略单个删除失败 */ }
 }
 
+// 迁移旧版用户配置：旧版写在 <vault>/.word-memo/user/ 下（点开头目录，Sync 不会同步）。
+// 目标目录中还没有同名文件时把旧文件搬过去，避免老用户升级后「账号消失」；目标已有同名则保留目标
+// （目标里那份更可能来自云端同步，属较新数据）
+function migrateLegacyUserDir(vaultBase, userDirName) {
+    if (!fs || !path || !vaultBase) return; // 仅桌面端有 Node fs 与绝对根
+    const legacy = path.join(vaultBase, APP_DIR, DEFAULT_USER_DIR);
+    const target = path.join(vaultBase, userDirName);
+    if (path.resolve(legacy) === path.resolve(target)) return;
+    let files;
+    try {
+        files = fs.readdirSync(legacy).filter((f) => /^user_.+\.json$/i.test(f));
+    } catch (e) { return; } // 无旧目录：无事可做
+    if (!files.length) return;
+    try {
+        const existing = new Set(fs.existsSync(target) ? fs.readdirSync(target) : []);
+        fs.mkdirSync(target, { recursive: true });
+        for (const f of files) {
+            if (existing.has(f)) continue;
+            fs.renameSync(path.join(legacy, f), path.join(target, f));
+        }
+    } catch (e) { /* 迁移失败不阻塞启动 */ }
+}
+
 // 读文本：桌面 fs.readFileSync；移动端 vault.adapter.read
 async function readTextFile(p, adapter) {
     if (fs) return fs.readFileSync(p, 'utf8');
@@ -714,8 +750,10 @@ async function listDir(p, adapter) {
 // 内置静态服务：把 vault 根目录以 http://127.0.0.1:<随机端口> 暴露，
 // 供 iframe 使用真实 origin 加载（app:// 下外部样式表/脚本会被 Obsidian CSP 拦截）。
 class StaticServer {
-    constructor(root) {
+    constructor(root, userDirFn) {
         this.root = path.resolve(root);
+        // 用户配置目录的绝对路径解析器：由插件注入，因其位于 vault 根下而非应用根 .word-memo/ 内
+        this.userDirFn = userDirFn || null;
         this.server = null;
         this.port = 0;
     }
@@ -762,7 +800,8 @@ class StaticServer {
             res.end(body);
         };
         const action = pathname.slice(BRIDGE_PREFIX.length);
-        const userDir = path.join(this.root, USER_DIR);
+        // 用户配置目录由插件注入（vault 根下的可同步目录）；未注入时回落应用根内的默认目录
+        const userDir = this.userDirFn ? this.userDirFn() : path.join(this.root, DEFAULT_USER_DIR);
 
         if (action === 'ping') { send(200, JSON.stringify({ ok: true })); return; }
 
@@ -1339,6 +1378,7 @@ class WordMemoSettingTab extends PluginSettingTab {
         this.renderBack(containerEl);
         // 不设顶层标题（尤其不使用插件名）；分区头在各分区内呈现
         this.section(containerEl, '取词', '文本层直接取词；图片则用系统 OCR 识别光标下的单词。', (body) => this.lookupSection(body));
+        this.section(containerEl, '配置存储', '用户配置以 JSON 文件保存在 vault 内的普通目录，才能随 Obsidian Sync 同步到手机等其它端。', (body) => this.storageSection(body));
         this.section(containerEl, '背单词模式', '练习时右侧栏单词详情的显示时机，辅助巩固错词或复核记忆。', (body) => this.practiceSection(body));
         this.section(containerEl, null, null, (body) => this.aboutSection(body));
     }
@@ -1365,6 +1405,20 @@ class WordMemoSettingTab extends PluginSettingTab {
         }
         const body = section.createDiv({ cls: 'word-memo-section-body' });
         render(body);
+    }
+
+    // 配置存储分区：自定义用户配置目录（相对 vault 根；点开头目录不会被 Obsidian Sync 同步）
+    storageSection(body) {
+        new Setting(body)
+            .setName('用户配置目录')
+            .setDesc('相对 vault 根目录的位置，默认 user。请勿使用以「.」开头的目录或绝对路径——点开头目录 Obsidian Sync 不会同步。修改后立即生效；既有配置文件不会自动搬移，如需迁移请手动移动。')
+            .addText((tx) => tx
+                .setPlaceholder(DEFAULT_USER_DIR)
+                .setValue(normalizeUserDir(this.plugin.obSettings.userDir))
+                .onChange(async (v) => {
+                    this.plugin.obSettings.userDir = normalizeUserDir(v);
+                    await this.plugin.persistLocalSettings();
+                }));
     }
 
     // 取词分区：宿主功能开关（悬浮取词 / 划词查询 / 右侧窗口查词）+ 取景框调试
@@ -1467,7 +1521,7 @@ module.exports = class WordMemoPlugin extends Plugin {
 
         // 宿主侧功能开关：悬浮取词（文本 + 图片 OCR）/ 划词查询 / 右侧窗口查词。
         // 均在插件设置页维护，持久化到插件数据；右侧窗口查词另注入 iframe 供页面使用
-        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true, answerLookup: 'wrong' };
+        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true, answerLookup: 'wrong', userDir: DEFAULT_USER_DIR };
         this.hoverWord = ''; // 当前悬浮所在单词（同一单词不重复查询、不重置计时）
         this.hoverTimer = null;
         this.hoverTick = 0; // 取词节流时间戳
@@ -1606,7 +1660,7 @@ module.exports = class WordMemoPlugin extends Plugin {
         };
         try {
             const adapter = this.app.vault.adapter;
-            const userDir = USER_DIR;
+            const userDir = normalizeUserDir(this.obSettings.userDir);
             const action = String(req.action || '');
             const params = req.params || {};
             const name = sanitizeUser(params.name || '');
@@ -1638,8 +1692,15 @@ module.exports = class WordMemoPlugin extends Plugin {
                     const body = String(params.body || '');
                     // 校验 JSON 合法性，避免破坏用户配置文件
                     try { JSON.parse(body); } catch (e) { reply(false, 400, { error: 'invalid json' }); return; }
-                    // adapter.write 不会自动建父目录；先确保 userDir 存在
-                    if (!await adapter.exists(userDir)) await adapter.mkdir(userDir);
+                    // adapter.write 不会自动建父目录；逐级创建（自定义目录可能是多级，如 词忆/user）
+                    let dirCur = '';
+                    for (const part of userDir.split('/')) {
+                        if (!part) continue;
+                        dirCur = dirCur ? dirCur + '/' + part : part;
+                        if (!await adapter.exists(dirCur)) {
+                            try { await adapter.mkdir(dirCur); } catch (e) { /* 已存在或并发创建：忽略 */ }
+                        }
+                    }
                     await adapter.write(userFile, body);
                     reply(true, 200, { ok: true });
                     return;
@@ -2249,7 +2310,10 @@ module.exports = class WordMemoPlugin extends Plugin {
                 this.baseUrl = null;
                 console.info('词忆：移动端运行，通过 Obsidian 资源路径加载页面');
             } else {
-                const srv = new StaticServer(root);
+                const userDirName = normalizeUserDir(this.obSettings.userDir);
+                migrateLegacyUserDir(vaultBase, userDirName); // 旧版配置在 .word-memo/user/，先搬到可同步目录
+                // 解析器每次请求时现取设置值，改设置后无需重启插件即可生效
+                const srv = new StaticServer(root, () => path.join(vaultBase, normalizeUserDir(this.obSettings.userDir)));
                 const port = await srv.start(saved.port || DEFAULT_PORT);
                 this.server = srv;
                 this.baseUrl = 'http://127.0.0.1:' + port;
