@@ -909,6 +909,47 @@ class StaticServer {
             }
         }
 
+        // 写盘前自动备份：把现有 user_*.json 另存到 user/.backup/ 下带时间戳的副本。
+        // 用户名仍走 sanitizeUser；时间戳另行过滤（其中的 '-' 是合法字符，不能一起被替换成 '_'）
+        if (action === 'backup-user') {
+            const chunks = [];
+            let size = 0;
+            req.on('data', (c) => {
+                size += c.length;
+                if (size > 1024 * 1024) { req.destroy(); return; } // 请求体仅 {name, ts}，极小
+                chunks.push(c);
+            });
+            req.on('end', () => {
+                let obj = null;
+                try { obj = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+                catch (e) { send(400, JSON.stringify({ ok: false, error: 'invalid json' })); return; }
+                const srcName = sanitizeUser(obj && obj.name);
+                const ts = String((obj && obj.ts) || '').replace(/[\\/:*?"<>|]/g, '-');
+                if (!ts) { send(400, JSON.stringify({ ok: false, error: 'missing ts' })); return; }
+                const srcPath = path.join(userDir, 'user_' + srcName + '.json');
+                if (path.dirname(srcPath) !== userDir) { send(400, JSON.stringify({ ok: false, error: 'invalid name' })); return; }
+                let content;
+                try { content = fs.readFileSync(srcPath); }
+                catch (e) { send(404, JSON.stringify({ ok: false, error: 'no source' })); return; } // 首次写入：无现有文件，无需备份
+                try {
+                    const bakDir = path.join(userDir, '.backup');
+                    fs.mkdirSync(bakDir, { recursive: true });
+                    fs.writeFileSync(path.join(bakDir, 'user_' + srcName + '.' + ts + '.json'), content);
+                    // 剪枝：文件名内 ISO 时间戳字典序即时间序，保留该用户最新 5 份
+                    const prefix = 'user_' + srcName + '.';
+                    const all = fs.readdirSync(bakDir)
+                        .filter((f) => f.startsWith(prefix) && /\.json$/i.test(f)).sort();
+                    for (let i = 0; i < all.length - 5; i++) {
+                        try { fs.rmSync(path.join(bakDir, all[i]), { force: true }); } catch (e) { /* 忽略 */ }
+                    }
+                    send(200, JSON.stringify({ ok: true }));
+                } catch (e) {
+                    send(500, JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
         send(404, JSON.stringify({ error: 'unknown action' }));
     }
 
@@ -1779,6 +1820,33 @@ module.exports = class WordMemoPlugin extends Plugin {
                     return;
                 }
                 reply(false, 405, { error: 'method not allowed' });
+                return;
+            }
+            // 写盘前自动备份（移动端）：把现有 user_*.json 另存到 user/.backup/ 下带时间戳的副本。
+            // 与 'user' 动作同目录；无现有文件则跳过。剪枝保留该用户最新 5 份
+            if (action === 'backup-user') {
+                let obj = null;
+                try { obj = JSON.parse(String(params.body || '')); }
+                catch (e) { reply(false, 400, { ok: false, error: 'invalid json' }); return; }
+                const bakUser = sanitizeUser(obj && obj.name);
+                const ts = String((obj && obj.ts) || '').replace(/[\\/:*?"<>|]/g, '-');
+                if (!ts) { reply(false, 400, { ok: false, error: 'missing ts' }); return; }
+                const bakSrc = userDir + '/user_' + bakUser + '.json';
+                if (!await adapter.exists(bakSrc)) { reply(true, 200, { ok: true, skipped: true }); return; }
+                const data = await adapter.read(bakSrc);
+                const content = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
+                await writeEntry(userDir, '.backup/user_' + bakUser + '.' + ts + '.json', content, adapter);
+                try {
+                    const list = await adapter.list(userDir + '/.backup');
+                    const prefix = 'user_' + bakUser + '.';
+                    const all = ((list && list.files) ? list.files : [])
+                        .map((f) => f.split('/').pop())
+                        .filter((f) => f.startsWith(prefix) && /\.json$/i.test(f)).sort();
+                    for (const old of all.slice(0, Math.max(0, all.length - 5))) {
+                        try { await adapter.remove(userDir + '/.backup/' + old); } catch (e) { /* 忽略 */ }
+                    }
+                } catch (e) { /* 无 .backup 目录：忽略 */ }
+                reply(true, 200, { ok: true });
                 return;
             }
             // 词典安装（移动端）：页面下载完内容后经桥落盘到应用目录 data/ 并重建清单。
