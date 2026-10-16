@@ -1079,7 +1079,7 @@ class FrameView extends ItemView {
         // 服务尚未监听时先占位，待 onload 完成后由 reloadFrame 补载
         this.frame = this.contentEl.createEl('iframe', { cls: this.opts.frameClasses });
         this.frame.setAttribute('allow', 'clipboard-read; clipboard-write; microphone');
-        this.mountFrame();
+        this.mountFrame().catch(() => {});
 
         // 主题实时同步：iframe 加载完成后推送一次，并在 Obsidian 主题变化时持续推送
         this.frame.addEventListener('load', () => {
@@ -1096,17 +1096,25 @@ class FrameView extends ItemView {
     }
 
     // 解析入口页地址（内置 http 服务优先，不可用时回退 app:// 资源路径）；都不可用返回 null
-    resolveSrc() {
+    async resolveSrc() {
         const plugin = this.plugin;
         let src;
         if (plugin && plugin.baseUrl) {
             // 内置服务已就绪：从服务根加载（发行版为内嵌包解压目录 .word-memo/）
             src = plugin.baseUrl + '/' + encodeURIComponent(ENTRY_FILE);
         } else {
-            // 开发态回退：直接读 vault 内的入口页
-            const file = this.app.vault.getAbstractFileByPath(ENTRY_FILE);
-            if (!file) return null;
-            src = this.app.vault.adapter.getResourcePath(file.path);
+            // 开发态 / 移动端回退：先查 vault 根，找不到再查 .word-memo/（发行版解压目录）
+            // 桌面端 StaticServer 启动失败时同样走这条路径；移动端无 StaticServer，这是唯一通道
+            // 用 adapter.exists + 路径拼接：避开 vault 索引（移动端 vault.adapter.writeBinary
+            // 异步写入后索引可能还没刷新，getAbstractFileByPath 会返回 null）
+            const adapter = this.app.vault.adapter;
+            const candidates = [ENTRY_FILE, APP_DIR + '/' + ENTRY_FILE];
+            let found = null;
+            for (const p of candidates) {
+                try { if (await adapter.exists(p)) { found = p; break; } } catch (e) { /* 忽略 */ }
+            }
+            if (!found) return null;
+            src = adapter.getResourcePath(found);
         }
 
         // 附加查询参数：视图模式 + 宿主主题（主题随参数带入，避免首屏闪烁）+ 宿主标识
@@ -1118,13 +1126,43 @@ class FrameView extends ItemView {
         return src + (src.indexOf('?') === -1 ? '?' : '&') + params.join('&');
     }
 
+    // 同步版（兼容旧调用方）：在第一次 resolveSrc 完成前，mountFrame 会用同步路径先试一次
+    resolveSrcSync() {
+        const plugin = this.plugin;
+        if (plugin && plugin.baseUrl) {
+            return plugin.baseUrl + '/' + encodeURIComponent(ENTRY_FILE)
+                + (this.opts.query ? '?' + this.opts.query + '&' : '?')
+                + 'wmTheme=' + hostTheme() + '&wmHost=obsidian';
+        }
+        // 兜底：用 vault 索引同步查（移动端索引可能未刷新，但桌面端可用）
+        let file = this.app.vault.getAbstractFileByPath(ENTRY_FILE);
+        if (!file) file = this.app.vault.getAbstractFileByPath(APP_DIR + '/' + ENTRY_FILE);
+        if (!file) return null;
+        return this.app.vault.adapter.getResourcePath(file.path)
+            + (this.opts.query ? '?' + this.opts.query + '&' : '?')
+            + 'wmTheme=' + hostTheme() + '&wmHost=obsidian';
+    }
+
     // 挂载/重载 iframe 内容（服务就绪后调用可修正首次打开时的空白）
-    mountFrame() {
-        const src = this.resolveSrc();
+    async mountFrame(retryLeft = 12) {
+        const src = await this.resolveSrc();
         if (!src) {
+            // 兜底：同步路径再试一次（resolveSrc 失败但 vault 索引可能已刷新）
+            const syncSrc = this.resolveSrcSync();
+            if (syncSrc) {
+                this.frame.src = syncSrc;
+                return;
+            }
+            // 移动端解压是异步过程（vault.adapter.writeBinary + 索引延迟刷新），
+            // 第一次进来时入口文件可能还没落盘。每 500ms 重试一次，最多 12 次（6 秒），
+            // 覆盖解压完成窗口；仍找不到则提示用户。
+            if (retryLeft > 0) {
+                setTimeout(() => { this.mountFrame(retryLeft - 1).catch(() => {}); }, 500);
+                return;
+            }
             this.contentEl.empty();
             this.contentEl.createEl('div', {
-                text: `未找到入口文件：${ENTRY_FILE}（请确认它位于 vault 根目录）`
+                text: `未找到入口文件：${ENTRY_FILE}（请确认它位于 vault 根目录或 ${APP_DIR}/）`
             });
             new Notice('词忆：未找到入口文件 ' + ENTRY_FILE);
             return;
@@ -1136,7 +1174,7 @@ class FrameView extends ItemView {
 
     // onload 中服务启动完成后回调，刷新已打开视图
     reloadFrame() {
-        if (this.frame) this.mountFrame();
+        if (this.frame) this.mountFrame().catch(() => {});
     }
 
     // 向 iframe 推送宿主主题（页面按自身「跟随系统主题」开关决定是否采纳）
