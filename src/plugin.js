@@ -1,12 +1,17 @@
 const { Plugin, ItemView, Notice, addIcon, PluginSettingTab, Setting, setIcon } = require('obsidian');
-const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const zlib = require('zlib');
-const crypto = require('crypto');
-const { execFile } = require('child_process');
+// 以下 Node 模块在移动端不可用（Obsidian 移动端基于 Capacitor，没有 Node 运行时）。
+// 包装为 try/catch：失败时保留 null，后续按 IS_DESKTOP 跳过对应分支，避免顶层崩溃
+let http, https, fs, path, os, zlib, crypto, execFile;
+try { http = require('http'); } catch (e) { http = null; }
+try { https = require('https'); } catch (e) { https = null; }
+try { fs = require('fs'); } catch (e) { fs = null; }
+try { path = require('path'); } catch (e) { path = null; }
+try { os = require('os'); } catch (e) { os = null; }
+try { zlib = require('zlib'); } catch (e) { zlib = null; }
+try { crypto = require('crypto'); } catch (e) { crypto = null; }
+try { execFile = require('child_process').execFile; } catch (e) { execFile = null; }
+// 移动端识别：只要基础模块缺失或 process.platform 非 win32/linux/darwin 即视为移动端
+const IS_DESKTOP = !!(http && fs && path && zlib);
 
 const VIEW_TYPE = 'word-memo-view';
 // 右侧栏「查单词」视图（复用同一入口页的 dict-lookup 引擎，?wmView=dict 切换为侧栏模式）
@@ -558,22 +563,27 @@ function pickOcrWord(words, px, py) {
 // 解压内嵌应用包（发行版由 tools/web2ob.py 注入 WM_APP_BUNDLE）到 vault 内的 APP_DIR，
 // 返回该目录绝对路径；开发态（未注入）返回 null，调用方回退到 vault 根目录。
 // 包格式：WMB1 + 条目数(4) + [路径长(2) 路径 内容长(4) 内容] * N，整体 gzip 后 base64
-function extractAppBundle(vaultBase) {
+// 桌面端用 Node zlib 同步解压；移动端用 WebView 原生 DecompressionStream('gzip') + vault.adapter 异步落盘
+// adapter：vault.adapter 实例（Obsidian 跨平台 API）。桌面端可传 null，内部用 Node fs；移动端必须传
+async function extractAppBundle(vaultBase, adapter) {
     if (typeof WM_APP_BUNDLE !== 'string' || !WM_APP_BUNDLE) return null;
-    const target = path.join(vaultBase, APP_DIR);
-    const marker = path.join(target, '.wm-version');
+    const target = path ? path.join(vaultBase, APP_DIR) : vaultBase + '/' + APP_DIR;
+    const marker = path ? path.join(target, '.wm-version') : target + '/.wm-version';
     // 记录上一版包解压出的文件清单（相对路径，一行一个）。包结构改动后据此删掉
     // 「旧版有、新版无」的残留：否则旧文件会永久留在 vault 里，旧词典还会被下面的
-    // 「保留用户词典」逻辑重新注册回 dict-manifest，等于没瘦身。只记包管文件，不碰用户数据。
-    const filesMarker = path.join(target, '.wm-files');
+    // 「保留用户词典」逻辑重新注册回 dict-manifest，等于没瘦身。只记包管文件，不碰用户数据
+    const filesMarker = path ? path.join(target, '.wm-files') : target + '/.wm-files';
     // 指纹 = 版本号 + 包内容哈希：只要应用包变了就必须重新解压，
     // 否则开发期改了应用文件、版本号没动，vault 里会一直跑旧副本
-    const stamp = WM_APP_VERSION + '-' + crypto.createHash('sha1').update(WM_APP_BUNDLE).digest('hex').slice(0, 12);
+    // WM_APP_STAMP 在 web2ob.py 构建时算好，宿主无需 crypto 模块（移动端无 Node crypto）
+    const stamp = (typeof WM_APP_STAMP === 'string' && WM_APP_STAMP)
+        ? WM_APP_STAMP
+        : (WM_APP_VERSION + '-' + (crypto ? crypto.createHash('sha1').update(WM_APP_BUNDLE).digest('hex').slice(0, 12) : ''));
     try {
-        if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === stamp) return target;
+        if (await readTextFile(marker, adapter) === stamp) return target;
     } catch (e) { /* 读取失败则重新解压 */ }
 
-    const raw = zlib.brotliDecompressSync(Buffer.from(WM_APP_BUNDLE, 'base64'));
+    const raw = await decompressBundle(WM_APP_BUNDLE);
     if (raw.slice(0, 4).toString('ascii') !== 'WMB1') throw new Error('内嵌应用包格式不正确');
 
     let off = 4;
@@ -585,40 +595,99 @@ function extractAppBundle(vaultBase) {
         const size = raw.readUInt32BE(off); off += 4;
         const content = raw.slice(off, off + size); off += size;
 
-        // 防目录穿越：解压目标必须仍落在 target 内
-        const filePath = path.resolve(target, name);
-        if (filePath !== target && !filePath.startsWith(target + path.sep)) continue;
-        fs.mkdirSync(path.dirname(filePath), { recursive: true });
-        fs.writeFileSync(filePath, content);
+        await writeEntry(target, name, content, adapter);
         written.add(name);
     }
-    fs.writeFileSync(marker, stamp, 'utf8');
+    await writeTextFile(marker, stamp, adapter);
 
     // 清理上一版包的残留文件：必须在下面「保留用户词典」之前执行，
     // 否则已被新版移除的旧词典会被当成用户词典重新注册进清单
     try {
-        const prev = fs.readFileSync(filesMarker, 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
-        prev.forEach((name) => {
-            if (written.has(name)) return;
-            const stale = path.resolve(target, name);
-            if (!stale.startsWith(target + path.sep)) return; // 防目录穿越
-            try { fs.rmSync(stale, { force: true }); } catch (e) { /* 忽略单个文件删除失败 */ }
-        });
+        const prev = (await readTextFile(filesMarker, adapter)).split('\n').map(s => s.trim()).filter(Boolean);
+        for (const name of prev) {
+            if (written.has(name)) continue;
+            await removeEntry(target, name, adapter);
+        }
     } catch (e) { /* 首次解压：无上一版清单 */ }
-    fs.writeFileSync(filesMarker, Array.from(written).sort().join('\n') + '\n', 'utf8');
+    await writeTextFile(filesMarker, Array.from(written).sort().join('\n') + '\n', adapter);
 
     // 保留用户此前导入的词典：把非内嵌的 data/*-dict.js / *-dict.json 重新并入清单（内嵌文件已被本次写入覆盖）
     try {
-        const dataDir = path.join(target, 'data');
-        fs.readdirSync(dataDir).forEach((f) => {
-            if (!/-dict\.(js|json)$/i.test(f) || f === 'dict-manifest.js' || written.has('data/' + f)) return;
+        const dataDir = target + '/data';
+        const names = await listDir(dataDir, adapter);
+        for (const f of names) {
+            if (!/-dict\.(js|json)$/i.test(f) || f === 'dict-manifest.js' || written.has('data/' + f)) continue;
             // .json 词典的变量名由文件名推导，无需读入整份内容（oaldpe 达 320MB，全量读入会明显拖慢启动）
-            const content = /-dict\.(js)$/i.test(f) ? fs.readFileSync(path.join(dataDir, f), 'utf8') : '';
+            const content = /-dict\.(js)$/i.test(f) ? await readTextFile(dataDir + '/' + f, adapter) : '';
             upsertDictManifest(dataDir, f, content);
-        });
+        }
     } catch (e) { /* 忽略：无 data 目录或读取失败 */ }
 
     return target;
+}
+
+// 解压 base64 包为 Buffer：桌面 Node zlib，移动端 DecompressionStream('gzip')
+async function decompressBundle(b64) {
+    if (zlib) {
+        // 桌面端走 Node 同步解压（速度最快）；Buffer.from(...,'base64') 直接给 zlib.gunzipSync 即可
+        return zlib.gunzipSync(Buffer.from(b64, 'base64'));
+    }
+    // 移动端：atob → Uint8Array → Blob → DecompressionStream('gzip') → ArrayBuffer → Buffer
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const stream = new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')));
+    const ab = await stream.arrayBuffer();
+    return Buffer.from(ab);
+}
+
+// 写入条目：桌面 fs.writeFileSync；移动端 vault.adapter.writeBinary
+async function writeEntry(target, name, content, adapter) {
+    const filePath = target + '/' + name;
+    if (fs) {
+        if (!filePath.startsWith(target + path.sep) && filePath !== target) return; // 防目录穿越
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, content);
+        return;
+    }
+    // 移动端：vault.adapter.writeBinary，自动建父目录；不需 mkdir
+    if (!filePath.startsWith(target + '/')) return; // 防目录穿越
+    if (!adapter) throw new Error('移动端必须传入 vault.adapter');
+    await adapter.writeBinary(filePath, content instanceof Uint8Array ? content : new Uint8Array(content));
+}
+
+async function removeEntry(target, name, adapter) {
+    const filePath = target + '/' + name;
+    if (!filePath.startsWith(target + '/')) return;
+    if (fs) {
+        try { fs.rmSync(filePath, { force: true }); } catch (e) { /* 忽略 */ }
+        return;
+    }
+    if (!adapter) return;
+    try { await adapter.remove(filePath); } catch (e) { /* 忽略单个删除失败 */ }
+}
+
+// 读文本：桌面 fs.readFileSync；移动端 vault.adapter.read
+async function readTextFile(p, adapter) {
+    if (fs) return fs.readFileSync(p, 'utf8');
+    if (!adapter) throw new Error('移动端必须传入 vault.adapter');
+    const data = await adapter.read(p);
+    return typeof data === 'string' ? data : new TextDecoder('utf-8').decode(data);
+}
+
+// 写文本：桌面 fs.writeFileSync；移动端 vault.adapter.write
+async function writeTextFile(p, text, adapter) {
+    if (fs) { fs.writeFileSync(p, text, 'utf8'); return; }
+    if (!adapter) throw new Error('移动端必须传入 vault.adapter');
+    await adapter.write(p, text);
+}
+
+// 列目录：桌面 fs.readdirSync；移动端 vault.adapter.list
+async function listDir(p, adapter) {
+    if (fs) return fs.readdirSync(p);
+    if (!adapter) throw new Error('移动端必须传入 vault.adapter');
+    const result = await adapter.list(p);
+    return (result && result.files) ? result.files.map((f) => f.split('/').pop()) : [];
 }
 
 // 内置静态服务：把 vault 根目录以 http://127.0.0.1:<随机端口> 暴露，
@@ -705,9 +774,18 @@ class StaticServer {
             }
 
             if (req.method === 'POST') {
-                let body = '';
-                req.on('data', (c) => { body += c; if (body.length > 64 * 1024 * 1024) req.destroy(); });
+                // 按 Buffer 收集后统一解码：body += c 会对每个 chunk 单独解码，
+                // 多字节 UTF-8 字符（中文）被分包切断时残缺字节解成 U+FFFD 方块问号，
+                // 导致中文笔记/释义/例句写入 user_*.json 即乱码
+                const chunks = [];
+                let size = 0;
+                req.on('data', (c) => {
+                    size += c.length;
+                    if (size > 64 * 1024 * 1024) { req.destroy(); return; }
+                    chunks.push(c);
+                });
                 req.on('end', () => {
+                    const body = Buffer.concat(chunks).toString('utf8');
                     try { JSON.parse(body); } catch (e) { send(400, JSON.stringify({ error: 'invalid json' })); return; }
                     fs.mkdir(userDir, { recursive: true }, () => {
                         fs.writeFile(filePath, body, 'utf8', (err) => {
@@ -771,9 +849,15 @@ class StaticServer {
             });
             return;
         }
-        let body = '';
-        req.on('data', (c) => { body += c; if (body.length > 512 * 1024 * 1024) req.destroy(); });
+        const chunks = [];
+        let size = 0;
+        req.on('data', (c) => {
+            size += c.length;
+            if (size > 512 * 1024 * 1024) { req.destroy(); return; }
+            chunks.push(c);
+        });
         req.on('end', () => {
+            const body = Buffer.concat(chunks).toString('utf8');
             try {
                 const { varName, content, file } = JSON.parse(body);
                 if (!varName || typeof content !== 'string') throw new Error('参数缺失');
@@ -800,9 +884,15 @@ class StaticServer {
             res.end(JSON.stringify(obj));
         };
         if (req.method !== 'POST') { send(405, { ok: false, error: 'method not allowed' }); return; }
-        let body = '';
-        req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
+        const chunks = [];
+        let size = 0;
+        req.on('data', (c) => {
+            size += c.length;
+            if (size > 64 * 1024) { req.destroy(); return; }
+            chunks.push(c);
+        });
         req.on('end', () => {
+            const body = Buffer.concat(chunks).toString('utf8');
             try {
                 const { file } = JSON.parse(body);
                 // 只接受 data/ 直属的词典文件名，杜绝路径穿越
@@ -839,9 +929,15 @@ class StaticServer {
         };
         if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
         if (req.method !== 'POST') { send(405, { errcode: -1, errmsg: 'method not allowed' }); return; }
-        let body = '';
-        req.on('data', (c) => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
+        const chunks = [];
+        let size = 0;
+        req.on('data', (c) => {
+            size += c.length;
+            if (size > 1024 * 1024) { req.destroy(); return; }
+            chunks.push(c);
+        });
         req.on('end', () => {
+            const body = Buffer.concat(chunks).toString('utf8');
             const key = String(req.headers['x-weread-key'] || '').trim();
             if (key.indexOf('wrk-') !== 0) { send(400, { errcode: -1, errmsg: '缺少微信读书 API Key（X-Weread-Key，格式 wrk-xxxxxxxx）' }); return; }
             const up = https.request('https://i.weread.qq.com/api/agent/gateway', {
@@ -1394,8 +1490,73 @@ module.exports = class WordMemoPlugin extends Plugin {
                         view.postToFrame({ type: 'wm-dict-note', word: d.word, note: d.note, ts: d.ts });
                     }
                 });
+            } else if (d.type === 'wm-bridge') {
+                // 移动端 postMessage 桥：iframe 内 fetch('/__wm__/...') 不可达，改由页面发消息让宿主代为读写 user_*.json
+                this.handlePostMessageBridge(d, e.source);
             }
         });
+    }
+
+    // 处理来自 iframe 的 wm-bridge 请求（移动端 fetch 不可用时的兜底通道）
+    // 请求形如 { type:'wm-bridge', id, method, action, params }
+    // 响应形如 { type:'wm-bridge-reply', id, ok, status, body }
+    async handlePostMessageBridge(req, source) {
+        const reply = (ok, status, body) => {
+            try { source && source.postMessage({ type: 'wm-bridge-reply', id: req.id, ok, status, body }, '*'); }
+            catch (e) { /* 忽略 */ }
+        };
+        try {
+            const adapter = this.app.vault.adapter;
+            const userDir = USER_DIR;
+            const action = String(req.action || '');
+            const params = req.params || {};
+            const name = sanitizeUser(params.name || '');
+            const userFile = userDir + '/user_' + name + '.json';
+            // 防止 name 注入导致目录穿越（sanitizeUser 已过滤非法字符，但仍校验一次）
+            const safeUserFile = userFile.replace(/\\/g, '/');
+            if (!safeUserFile.startsWith(userDir + '/') || safeUserFile.indexOf('..') >= 0) { reply(false, 400, { error: 'invalid name' }); return; }
+
+            if (action === 'ping') { reply(true, 200, { ok: true }); return; }
+            if (action === 'users') {
+                const list = await adapter.list(userDir);
+                const names = (list && list.files ? list.files : [])
+                    .map((f) => f.split('/').pop())
+                    .filter((n) => /^user_.+\.json$/i.test(n) && !/^user_template\.json$/i.test(n))
+                    .map((n) => n.slice('user_'.length, -'.json'.length))
+                    .filter(Boolean);
+                reply(true, 200, names);
+                return;
+            }
+            if (action === 'user') {
+                if (req.method === 'GET') {
+                    if (!await adapter.exists(userFile)) { reply(false, 404, { error: 'not found' }); return; }
+                    const data = await adapter.read(userFile);
+                    const text = typeof data === 'string' ? data : new TextDecoder('utf-8').decode(data);
+                    reply(true, 200, text);
+                    return;
+                }
+                if (req.method === 'POST') {
+                    const body = String(params.body || '');
+                    // 校验 JSON 合法性，避免破坏用户配置文件
+                    try { JSON.parse(body); } catch (e) { reply(false, 400, { error: 'invalid json' }); return; }
+                    // adapter.write 不会自动建父目录；先确保 userDir 存在
+                    if (!await adapter.exists(userDir)) await adapter.mkdir(userDir);
+                    await adapter.write(userFile, body);
+                    reply(true, 200, { ok: true });
+                    return;
+                }
+                if (req.method === 'DELETE') {
+                    if (await adapter.exists(userFile)) await adapter.remove(userFile);
+                    reply(true, 200, { ok: true });
+                    return;
+                }
+                reply(false, 405, { error: 'method not allowed' });
+                return;
+            }
+            reply(false, 404, { error: 'unknown action' });
+        } catch (e) {
+            reply(false, 500, { error: e && e.message ? e.message : String(e) });
+        }
     }
 
     // 向单个 iframe 注入宿主功能开关（页面据此决定「查看词典详情」是否交右侧栏承接）
@@ -1474,7 +1635,11 @@ module.exports = class WordMemoPlugin extends Plugin {
     // OCR 是否可用：悬浮取词关闭 / 非 Windows / 此前连续失败时直接跳过
     ocrAvailable() {
         if (!this.obSettings.hoverLookup || this.ocrState === 'off') return false;
-        if (process.platform !== 'win32') { this.ocrState = 'off'; return false; }
+        // 移动端无 execFile / process 不稳；非桌面端或非 Windows 一律关闭，避免抛错
+        if (!IS_DESKTOP || !execFile || typeof process === 'undefined' || process.platform !== 'win32') {
+            this.ocrState = 'off';
+            return false;
+        }
         return true;
     }
 
@@ -1962,24 +2127,33 @@ module.exports = class WordMemoPlugin extends Plugin {
     }
 
     // 后台启动内置静态服务（自动，无需用户手动执行任何命令）
+    // 移动端无 Node http/fs：跳过 StaticServer，baseUrl 留空，resolveSrc 回退到 vault.adapter.getResourcePath
     async startServer() {
         try {
             const saved = (await this.loadData()) || {};
-            const vaultBase = this.app.vault.adapter.getBasePath();
+            const adapter = this.app.vault.adapter;
+            const vaultBase = adapter.getBasePath();
             // 发行版：解压内嵌应用包，以其目录为服务根；开发态（无内嵌包）：回退到 vault 根目录
             let root = vaultBase;
             try {
-                const extracted = extractAppBundle(vaultBase);
+                const extracted = await extractAppBundle(vaultBase, adapter);
                 if (extracted) root = extracted;
             } catch (e) {
                 console.error('词忆：解压内嵌应用包失败，回退到 vault 根目录', e);
             }
-            const srv = new StaticServer(root);
-            const port = await srv.start(saved.port || DEFAULT_PORT);
-            this.server = srv;
-            this.baseUrl = 'http://127.0.0.1:' + port;
-            // 记住实际端口，保证 origin 稳定（localStorage 数据不丢）
-            if (saved.port !== port) await this.saveData(Object.assign({}, saved, { port }));
+            if (!IS_DESKTOP) {
+                // 移动端无 http 模块：让 FrameView.resolveSrc 走 getResourcePath 分支
+                this.server = null;
+                this.baseUrl = null;
+                console.info('词忆：移动端运行，通过 Obsidian 资源路径加载页面');
+            } else {
+                const srv = new StaticServer(root);
+                const port = await srv.start(saved.port || DEFAULT_PORT);
+                this.server = srv;
+                this.baseUrl = 'http://127.0.0.1:' + port;
+                // 记住实际端口，保证 origin 稳定（localStorage 数据不丢）
+                if (saved.port !== port) await this.saveData(Object.assign({}, saved, { port }));
+            }
         } catch (e) {
             console.error('词忆：内置静态服务启动失败，将回退到 app:// 资源路径', e);
             new Notice('词忆：内置服务启动失败，页面样式与交互可能不可用');
