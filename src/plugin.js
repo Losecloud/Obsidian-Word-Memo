@@ -185,6 +185,52 @@ function removeDictManifestEntry(dataDir, fname) {
     return next.length;
 }
 
+// 移动端版清单更新（走 vault.adapter 异步读写）：行为与 upsertDictManifest 一致。
+// 桌面端有 Node fs，走同步版；移动端无 fs，必须用这一版
+async function upsertDictManifestByAdapter(adapter, dataDir, fname, content, varNameHint) {
+    let varName = varNameHint || '';
+    if (!varName) {
+        const mv = /var\s+([\p{L}_$][\p{L}\p{N}_$]*)\s*=\s*\{/u.exec(String(content || '').slice(0, 4096));
+        if (mv) varName = mv[1];
+    }
+    if (!varName && /-dict\.json$/i.test(fname)) varName = dictVarNameFromFile(fname);
+    if (!varName) return { count: 0, mdd: '' };
+    const mf = dataDir + '/dict-manifest.js';
+    let list = [];
+    try {
+        const arr = /\[[\s\S]*\]/.exec(await readTextFile(mf, adapter));
+        if (arr) list = JSON.parse(arr[0]);
+    } catch (e) { /* 无清单或格式异常：从空表开始 */ }
+    if (!Array.isArray(list)) list = [];
+    const stem = fname.replace(/-dict\.(js|json)$/i, '');
+    const entry = { file: fname, name: DICT_DISPLAY_NAMES[fname] || stem, varName: varName };
+    if (/-dict\.json$/i.test(fname)) entry.format = 'json';
+    let mdd = '';
+    try { if (await adapter.exists(dataDir + '/' + stem)) mdd = stem; } catch (e) { /* 忽略探测失败 */ }
+    if (mdd) entry.mdd = mdd;
+    const i = list.findIndex((x) => x && x.file === fname);
+    if (i >= 0) list[i] = Object.assign({}, list[i], entry);
+    else list.push(entry);
+    list.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    await writeTextFile(mf, '// 自动生成：浏览器导入或 tools/convert-mdx.js 更新，请勿手改\nvar DICT_MANIFEST = ' + JSON.stringify(list, null, 1) + ';\n', adapter);
+    return { count: list.length, mdd: mdd };
+}
+
+// 移动端版清单移除：行为与 removeDictManifestEntry 一致
+async function removeDictManifestEntryByAdapter(adapter, dataDir, fname) {
+    const mf = dataDir + '/dict-manifest.js';
+    let list = [];
+    try {
+        const arr = /\[[\s\S]*\]/.exec(await readTextFile(mf, adapter));
+        if (arr) list = JSON.parse(arr[0]);
+    } catch (e) { /* 无清单：无需处理 */ }
+    if (!Array.isArray(list)) return 0;
+    const next = list.filter((x) => !x || x.file !== fname);
+    if (next.length === list.length) return list.length;
+    await writeTextFile(mf, '// 自动生成：浏览器导入或 tools/convert-mdx.js 更新，请勿手改\nvar DICT_MANIFEST = ' + JSON.stringify(next, null, 1) + ';\n', adapter);
+    return next.length;
+}
+
 const MIME = {
     '.html': 'text/html; charset=utf-8',
     '.htm': 'text/html; charset=utf-8',
@@ -1425,7 +1471,8 @@ class WordMemoSettingTab extends PluginSettingTab {
     lookupSection(body) {
         new Setting(body)
             .setName('悬浮取词')
-            .setDesc('鼠标在笔记文字上停留 0.5 秒即推送到右侧栏查词；停在图片/扫描页上时用 Windows 系统 OCR 识别光标下的单词（仅 Windows 桌面端，首次识别稍慢，之后走缓存）。关闭后不再取词。')
+            .setDesc('鼠标在笔记文字上停留 0.5 秒即推送到右侧栏查词；停在图片/扫描页上时用 Windows 系统 OCR 识别光标下的单词（仅 Windows 桌面端，首次识别稍慢，之后走缓存）。关闭后不再取词。移动端不可用（无鼠标悬停），此项已置灰。')
+            .setDisabled(!IS_DESKTOP)
             .addToggle((tg) => tg.setValue(this.plugin.obSettings.hoverLookup !== false).onChange(async (v) => {
                 this.plugin.obSettings.hoverLookup = v;
                 if (!v) this.plugin.cancelHover();
@@ -1433,7 +1480,8 @@ class WordMemoSettingTab extends PluginSettingTab {
             }));
         new Setting(body)
             .setName('取景框')
-            .setDesc('开启后，图片取词命中时在原图上高亮 OCR 取景框，并在右下角浮出送识别的裁剪图（3 秒后自动消失，不遮挡操作）。用于诊断识别不准的问题，默认关闭。')
+            .setDesc('开启后，图片取词命中时在原图上高亮 OCR 取景框，并在右下角浮出送识别的裁剪图（3 秒后自动消失，不遮挡操作）。用于诊断识别不准的问题，默认关闭。移动端不可用（依赖 Windows 系统 OCR），此项已置灰。')
+            .setDisabled(!IS_DESKTOP)
             .addToggle((tg) => tg.setValue(this.plugin.ocrDebug).onChange(async (v) => {
                 this.plugin.ocrDebug = v;
                 if (!v) this.plugin.hideOcrDebug();
@@ -1470,6 +1518,12 @@ class WordMemoSettingTab extends PluginSettingTab {
             line.createEl('strong', { text: term + '：' });
             line.appendText(text);
         });
+        // 移动端默认「均不显示」的说明：讲清原因，避免误以为功能缺失
+        if (!IS_DESKTOP) {
+            const line = desc.createEl('div', { cls: 'wm-answer-lookup-line' });
+            line.createEl('strong', { text: '移动端：' });
+            line.appendText('默认「均不显示」——手机右侧栏为覆盖式弹层，会在作答时遮挡题干。若从其它端同步过设置，此处可能仍是旧值，按需改回即可。');
+        }
         new Setting(body)
             .setName('右侧查词')
             .setDesc(desc)
@@ -1521,7 +1575,10 @@ module.exports = class WordMemoPlugin extends Plugin {
 
         // 宿主侧功能开关：悬浮取词（文本 + 图片 OCR）/ 划词查询 / 右侧窗口查词。
         // 均在插件设置页维护，持久化到插件数据；右侧窗口查词另注入 iframe 供页面使用
-        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true, answerLookup: 'wrong', userDir: DEFAULT_USER_DIR };
+        // answerLookup 默认值按平台区分：手机的右侧栏是覆盖式弹层，作答时弹出来会遮挡题干，
+        // 体验明显差于桌面端的自适应布局，故移动端默认「均不显示」（none）；桌面端沿用原默认
+        // 「答错显示」。已保存的设置值仍然优先（跨端同步过来的旧值不会被动改写）
+        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true, answerLookup: IS_DESKTOP ? 'wrong' : 'none', userDir: DEFAULT_USER_DIR };
         this.hoverWord = ''; // 当前悬浮所在单词（同一单词不重复查询、不重置计时）
         this.hoverTimer = null;
         this.hoverTick = 0; // 取词节流时间戳
@@ -1624,6 +1681,17 @@ module.exports = class WordMemoPlugin extends Plugin {
                 const v = leaf.view;
                 return v && v.frame && v.frame.contentWindow === e.source;
             });
+            // 「Obsidian设置」页签：应用内点击后唤起本插件自己的设置页。
+            // 主页 / 右侧栏 / 封面任一 iframe 都可能发起，故单独受理，不受下面 fromHost 限制
+            if (d.type === 'wm-open-ob-settings') {
+                const fromPluginFrame = [VIEW_TYPE, DICT_VIEW_TYPE, COVER_VIEW_TYPE].some((t) =>
+                    this.app.workspace.getLeavesOfType(t).some((leaf) => {
+                        const v = leaf.view;
+                        return v && v.frame && v.frame.contentWindow === e.source;
+                    }));
+                if (fromPluginFrame) this.openPluginSettings();
+                return;
+            }
             if (!fromHost) return;
             if (d.type === 'wm-dict-lookup' && d.word) {
                 // 「查看词典详情」：转交右侧栏查词视图承接，主页不弹结果窗口。
@@ -1713,9 +1781,53 @@ module.exports = class WordMemoPlugin extends Plugin {
                 reply(false, 405, { error: 'method not allowed' });
                 return;
             }
+            // 词典安装（移动端）：页面下载完内容后经桥落盘到应用目录 data/ 并重建清单。
+            // 内容随 params.body 一起传（与 'user' 动作同一通道）；移动端无内置 http 服务，
+            // 页面里 fetch('/save-dict') 会落到 http://localhost:8377 而必然失败
+            if (action === 'save-dict') {
+                let obj = null;
+                try { obj = JSON.parse(String(params.body || '')); }
+                catch (e) { reply(false, 400, { ok: false, error: 'invalid json' }); return; }
+                const varName = String((obj && obj.varName) || '');
+                const content = obj && typeof obj.content === 'string' ? obj.content : '';
+                if (!varName || !content) { reply(false, 400, { ok: false, error: '参数缺失' }); return; }
+                const wantJson = /-dict\.json$/i.test(String((obj && obj.file) || ''));
+                const safe = obj && typeof obj.file === 'string'
+                    && /^[^\\/:*?"<>|]+-dict\.(js|json)$/i.test(obj.file) && obj.file.charAt(0) !== '.' ? obj.file : '';
+                const fname = safe || dictFileName(varName, wantJson ? 'json' : 'js');
+                const dataDir = APP_DIR + '/data';
+                await writeEntry(APP_DIR, 'data/' + fname, content, adapter); // 自动逐级建目录后写入
+                const r = await upsertDictManifestByAdapter(adapter, dataDir, fname, content, varName);
+                reply(true, 200, { ok: true, file: fname, count: r.count, mdd: r.mdd });
+                return;
+            }
+            // 词典卸载（移动端）：删除应用目录 data/ 下的词典文件并更新清单
+            if (action === 'delete-dict') {
+                const file = String(params.file || '');
+                if (!/^[^\\/:*?"<>|]+-dict\.(js|json)$/i.test(file) || file.charAt(0) === '.') {
+                    reply(false, 400, { ok: false, error: '文件名不合法' });
+                    return;
+                }
+                const dataDir = APP_DIR + '/data';
+                try { if (await adapter.exists(dataDir + '/' + file)) await adapter.remove(dataDir + '/' + file); }
+                catch (e) { /* 文件不存在或删除失败：忽略 */ }
+                const count = await removeDictManifestEntryByAdapter(adapter, dataDir, file);
+                reply(true, 200, { ok: true, file: file, count: count });
+                return;
+            }
             reply(false, 404, { error: 'unknown action' });
         } catch (e) {
             reply(false, 500, { error: e && e.message ? e.message : String(e) });
+        }
+    }
+
+    // 打开本插件的设置页：供应用内「Obsidian设置」页签唤起（跳转到「第三方插件 → Word Memo」）
+    openPluginSettings() {
+        try {
+            this.app.setting.open();
+            this.app.setting.openTabById(this.manifest.id);
+        } catch (e) {
+            new Notice('词忆：未能打开 Obsidian 设置，请在「第三方插件」中手动找到 Word Memo');
         }
     }
 
