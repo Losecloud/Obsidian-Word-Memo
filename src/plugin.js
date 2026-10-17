@@ -1,4 +1,4 @@
-const { Plugin, ItemView, Notice, addIcon, PluginSettingTab, Setting, setIcon } = require('obsidian');
+const { Plugin, ItemView, Notice, addIcon, PluginSettingTab, Setting, setIcon, requestUrl } = require('obsidian');
 // 以下 Node 模块在移动端不可用（Obsidian 移动端基于 Capacitor，没有 Node 运行时）。
 // 包装为 try/catch：失败时保留 null，后续按 IS_DESKTOP 跳过对应分支，避免顶层崩溃
 let http, https, fs, path, os, zlib, crypto, execFile;
@@ -86,9 +86,10 @@ const DEFAULT_USER_DIR = 'user';
 function normalizeUserDir(value) {
     const parts = String(value == null ? '' : value).trim().replace(/\\/g, '/')
         .split('/').filter((p) => p && p !== '.');
-    // 拒绝越级（..），以及路径段中 Windows 不允许的字符（含盘符冒号）与结尾的点/空格
+    // 拒绝越级（..）、Windows 不允许的字符（含盘符冒号）、结尾的点/空格，
+    // 以及以「.」开头的路径段（隐藏目录不被 Obsidian Sync 同步，旧版曾把配置写在 .word-memo/user/ 导致移动端读不到）
     if (!parts.length
-        || parts.some((p) => p === '..' || /[<>:"|?*\u0000-\u001f]/.test(p) || /[. ]$/.test(p))) {
+        || parts.some((p) => p.charAt(0) === '.' || /[<>:"|?*\u0000-\u001f]/.test(p) || /[. ]$/.test(p))) {
         return DEFAULT_USER_DIR;
     }
     return parts.join('/');
@@ -683,7 +684,9 @@ async function extractAppBundle(vaultBase, adapter) {
             if (!/-dict\.(js|json)$/i.test(f) || f === 'dict-manifest.js' || written.has('data/' + f)) continue;
             // .json 词典的变量名由文件名推导，无需读入整份内容（oaldpe 达 320MB，全量读入会明显拖慢启动）
             const content = /-dict\.(js)$/i.test(f) ? await readTextFile(dataDir + '/' + f, adapter) : '';
-            upsertDictManifest(dataDir, f, content);
+            // 桌面端有 Node fs 走同步版；移动端无 fs，必须走 vault.adapter 异步版（否则抛错被外层 catch 吞掉，用户词典不会重新登记）
+            if (fs) upsertDictManifest(dataDir, f, content);
+            else await upsertDictManifestByAdapter(adapter, dataDir, f, content);
         }
     } catch (e) { /* 忽略：无 data 目录或读取失败 */ }
 
@@ -1262,7 +1265,10 @@ class FrameView extends ItemView {
             // 用 adapter.exists + 路径拼接：避开 vault 索引（移动端 vault.adapter.writeBinary
             // 异步写入后索引可能还没刷新，getAbstractFileByPath 会返回 null）
             const adapter = this.app.vault.adapter;
-            const candidates = [ENTRY_FILE, APP_DIR + '/' + ENTRY_FILE];
+            // 移动端只认解压目录 .word-memo/ 内的发行版入口：vault 根那份 `index - 词忆.html` 是
+            // 桌面开发态入口，会随 Obsidian Sync 一起同步过来（无法阻止），若优先命中它，
+            // 其相对路径资源在 vault 根下并不存在，会导致启动失败
+            const candidates = IS_DESKTOP ? [ENTRY_FILE, APP_DIR + '/' + ENTRY_FILE] : [APP_DIR + '/' + ENTRY_FILE];
             let found = null;
             for (const p of candidates) {
                 try { if (await adapter.exists(p)) { found = p; break; } } catch (e) { /* 忽略 */ }
@@ -1289,7 +1295,8 @@ class FrameView extends ItemView {
                 + 'wmTheme=' + hostTheme() + '&wmHost=obsidian';
         }
         // 兜底：用 vault 索引同步查（移动端索引可能未刷新，但桌面端可用）
-        let file = this.app.vault.getAbstractFileByPath(ENTRY_FILE);
+        // 与 resolveSrc 同策略：移动端只查解压目录，避免命中随 Sync 同步来的桌面入口
+        let file = IS_DESKTOP ? this.app.vault.getAbstractFileByPath(ENTRY_FILE) : null;
         if (!file) file = this.app.vault.getAbstractFileByPath(APP_DIR + '/' + ENTRY_FILE);
         if (!file) return null;
         return this.app.vault.adapter.getResourcePath(file.path)
@@ -1779,22 +1786,49 @@ module.exports = class WordMemoPlugin extends Plugin {
             if (!safeUserFile.startsWith(userDir + '/') || safeUserFile.indexOf('..') >= 0) { reply(false, 400, { error: 'invalid name' }); return; }
 
             if (action === 'ping') { reply(true, 200, { ok: true }); return; }
+            // 代取远程资源（移动端）：页面 app:// 下 fetch 跨域会被 WKWebView 拦截，
+            // 改用 Obsidian requestUrl（不经 CORS）下载词典数据；仅放行 http(s)，避免被当作任意协议跳板
+            if (action === 'fetch-url') {
+                let obj = null;
+                try { obj = JSON.parse(String(params.body || '')); }
+                catch (e) { reply(false, 400, { ok: false, error: 'invalid json' }); return; }
+                const url = String((obj && obj.url) || '');
+                if (!/^https?:\/\//i.test(url)) { reply(false, 400, { ok: false, error: 'invalid url' }); return; }
+                try {
+                    const resp = await requestUrl({ url: url });
+                    // 词典文件均为文本，直接回传 text（requestUrl 的响应体已整体读入内存）
+                    reply(true, 200, { ok: true, status: resp.status, text: resp.text });
+                } catch (e) {
+                    reply(false, 500, { ok: false, error: (e && e.message) || String(e) });
+                }
+                return;
+            }
             if (action === 'users') {
-                const list = await adapter.list(userDir);
-                const names = (list && list.files ? list.files : [])
-                    .map((f) => f.split('/').pop())
-                    .filter((n) => /^user_.+\.json$/i.test(n) && !/^user_template\.json$/i.test(n))
-                    .map((n) => n.slice('user_'.length, -'.json'.length))
-                    .filter(Boolean);
-                reply(true, 200, names);
+                try {
+                    const list = await adapter.list(userDir);
+                    const names = (list && list.files ? list.files : [])
+                        .map((f) => f.split('/').pop())
+                        .filter((n) => /^user_.+\.json$/i.test(n) && !/^user_template\.json$/i.test(n))
+                        .map((n) => n.slice('user_'.length, -'.json'.length))
+                        .filter(Boolean);
+                    reply(true, 200, names);
+                } catch (e) {
+                    // 目录不存在/不可读时明确回传实际使用的 userDir，便于定位（如指向未同步的隐藏目录）
+                    reply(false, 500, { ok: false, error: (e && e.message) || String(e), userDir: userDir });
+                }
                 return;
             }
             if (action === 'user') {
                 if (req.method === 'GET') {
-                    if (!await adapter.exists(userFile)) { reply(false, 404, { error: 'not found' }); return; }
-                    const data = await adapter.read(userFile);
-                    const text = typeof data === 'string' ? data : new TextDecoder('utf-8').decode(data);
-                    reply(true, 200, text);
+                    try {
+                        if (!await adapter.exists(userFile)) { reply(false, 404, { error: 'not found', userDir: userDir }); return; }
+                        const data = await adapter.read(userFile);
+                        const text = typeof data === 'string' ? data : new TextDecoder('utf-8').decode(data);
+                        reply(true, 200, text);
+                    } catch (e) {
+                        // 读取失败时回传实际使用的 userDir，便于定位（如指向未同步的隐藏目录）
+                        reply(false, 500, { ok: false, error: (e && e.message) || String(e), userDir: userDir });
+                    }
                     return;
                 }
                 if (req.method === 'POST') {
