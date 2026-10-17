@@ -750,6 +750,26 @@ async function removeEntry(target, name, adapter) {
     try { await adapter.remove(filePath); } catch (e) { /* 忽略单个删除失败 */ }
 }
 
+// 写后回读校验（对齐 easy-sync 的做法）：写入完成后再用 adapter 把文件读回来，
+// 确认其存在且字节数与预期一致。部分移动端环境下 adapter.write/writeBinary 会静默失败，
+// 回读能把「假成功」变成显式错误，避免页面以为导入成功、实际文件根本没落盘。
+// 参数 vaultPath 为 vault 相对路径；expectedBytes 为预期字节数（-1 表示只确认可读非空）
+async function verifyWrite(adapter, vaultPath, expectedBytes) {
+    if (!adapter) return false;
+    try {
+        if (typeof adapter.exists === 'function' && !await adapter.exists(vaultPath)) return false;
+        const data = (typeof adapter.readBinary === 'function')
+            ? await adapter.readBinary(vaultPath)
+            : await adapter.read(vaultPath);
+        const bytes = (data && typeof data.byteLength === 'number')
+            ? data.byteLength
+            : new TextEncoder().encode(String(data == null ? '' : data)).length;
+        return expectedBytes < 0 ? true : bytes === expectedBytes;
+    } catch (e) {
+        return false;
+    }
+}
+
 // 迁移旧版用户配置：旧版写在 <vault>/.word-memo/user/ 下（点开头目录，Sync 不会同步）。
 // 目标目录中还没有同名文件时把旧文件搬过去，避免老用户升级后「账号消失」；目标已有同名则保留目标
 // （目标里那份更可能来自云端同步，属较新数据）
@@ -1854,7 +1874,12 @@ module.exports = class WordMemoPlugin extends Plugin {
                         }
                     }
                     await adapter.write(userFile, body);
-                    reply(true, 200, { ok: true });
+                    // 写后回读校验：确认配置确实落盘且字节数一致，否则如实报错（避免空壳/未写入被当成成功）
+                    if (!await verifyWrite(adapter, userFile, new TextEncoder().encode(body).length)) {
+                        reply(false, 500, { ok: false, error: 'write verify failed', path: userFile });
+                        return;
+                    }
+                    reply(true, 200, { ok: true, path: userFile });
                     return;
                 }
                 if (req.method === 'DELETE') {
@@ -1907,9 +1932,55 @@ module.exports = class WordMemoPlugin extends Plugin {
                     && /^[^\\/:*?"<>|]+-dict\.(js|json)$/i.test(obj.file) && obj.file.charAt(0) !== '.' ? obj.file : '';
                 const fname = safe || dictFileName(varName, wantJson ? 'json' : 'js');
                 const dataDir = APP_DIR + '/data';
+                const dictPath = dataDir + '/' + fname;
                 await writeEntry(APP_DIR, 'data/' + fname, content, adapter); // 自动逐级建目录后写入
+                // 写后回读校验：确认词典文件确实落盘且字节数一致；失败则直接报错并附上实际路径，
+                // 绝不继续更新清单（否则清单会指向一个并不存在的词典文件）
+                if (!await verifyWrite(adapter, dictPath, new TextEncoder().encode(content).length)) {
+                    reply(false, 500, { ok: false, error: 'write verify failed', path: dictPath });
+                    return;
+                }
                 const r = await upsertDictManifestByAdapter(adapter, dataDir, fname, content, varName);
-                reply(true, 200, { ok: true, file: fname, count: r.count, mdd: r.mdd });
+                reply(true, 200, { ok: true, file: fname, path: dictPath, count: r.count, mdd: r.mdd });
+                return;
+            }
+            // 词典安装（移动端，easy-sync 式）：改由插件侧用 requestUrl 直接下载并落盘，
+            // 页面不再自己 fetch 后再把整份内容经桥回传——省掉一次大字符串搬运，也绕开 app:// 下的跨域限制
+            if (action === 'download-dict') {
+                let obj = null;
+                try { obj = JSON.parse(String(params.body || '')); }
+                catch (e) { reply(false, 400, { ok: false, error: 'invalid json' }); return; }
+                const url = String((obj && obj.url) || '');
+                const varName = String((obj && obj.varName) || '');
+                // 与 'fetch-url' 同一白名单：只放行 http(s)，避免被当作任意协议跳板
+                if (!/^https?:\/\//i.test(url)) { reply(false, 400, { ok: false, error: 'invalid url' }); return; }
+                let resp;
+                try { resp = await requestUrl({ url: url }); }
+                catch (e) { reply(false, 500, { ok: false, error: (e && e.message) || String(e) }); return; }
+                // 取字节：requestUrl 已把响应体整体读入内存；优先 arrayBuffer，个别环境缺失时退回文本编码
+                const bytes = (resp && resp.arrayBuffer)
+                    ? new Uint8Array(resp.arrayBuffer)
+                    : new TextEncoder().encode((resp && resp.text) || '');
+                // 目标文件名沿用 'save-dict' 的规则：合法 file 优先，否则按 varName 推导 -dict.(js|json)
+                const wantJson = /-dict\.json$/i.test(String((obj && obj.file) || ''));
+                const safe = obj && typeof obj.file === 'string'
+                    && /^[^\\/:*?"<>|]+-dict\.(js|json)$/i.test(obj.file) && obj.file.charAt(0) !== '.' ? obj.file : '';
+                const fname = safe || dictFileName(varName, wantJson ? 'json' : 'js');
+                const dataDir = APP_DIR + '/data';
+                const dictPath = APP_DIR + '/data/' + fname;
+                await writeEntry(APP_DIR, 'data/' + fname, bytes, adapter); // 自动逐级建目录后写入
+                // 写后回读校验：确认字节数一致；失败则如实报错并附实际路径，绝不更新清单
+                // （否则清单会指向一个并不存在的词典文件）
+                if (!await verifyWrite(adapter, dictPath, bytes.length)) {
+                    reply(false, 500, { ok: false, error: 'write verify failed', path: dictPath });
+                    return;
+                }
+                // 清单内容：.js 传文本供解析变量名，.json 传空串（由文件名约定推导变量名）
+                const manifestText = wantJson
+                    ? ''
+                    : ((resp && typeof resp.text === 'string') ? resp.text : new TextDecoder('utf-8').decode(bytes));
+                const r = await upsertDictManifestByAdapter(adapter, dataDir, fname, manifestText, varName);
+                reply(true, 200, { ok: true, file: fname, path: dictPath, count: r.count, mdd: r.mdd });
                 return;
             }
             // 词典卸载（移动端）：删除应用目录 data/ 下的词典文件并更新清单
