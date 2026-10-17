@@ -1520,21 +1520,30 @@ class WordMemoSettingTab extends PluginSettingTab {
         new Setting(body)
             .setName('悬浮取词')
             .setDesc('鼠标在笔记文字上停留 0.5 秒即推送到右侧栏查词；停在图片/扫描页上时用 Windows 系统 OCR 识别光标下的单词（仅 Windows 桌面端，首次识别稍慢，之后走缓存）。关闭后不再取词。移动端不可用（无鼠标悬停），此项已置灰。')
-            .setDisabled(!IS_DESKTOP)
-            .addToggle((tg) => tg.setValue(this.plugin.obSettings.hoverLookup !== false).onChange(async (v) => {
-                this.plugin.obSettings.hoverLookup = v;
-                if (!v) this.plugin.cancelHover();
-                await this.plugin.persistLocalSettings();
-            }));
+            .addToggle((tg) => {
+                tg.setValue(this.plugin.obSettings.hoverLookup !== false).onChange(async (v) => {
+                    this.plugin.obSettings.hoverLookup = v;
+                    if (!v) this.plugin.cancelHover();
+                    await this.plugin.persistLocalSettings();
+                });
+                // setDisabled 只作用于「已注册」的组件；若先 setDisabled 再 addToggle，
+                // 开关本身不会被禁用、仍可操作。故在 addToggle 之后显式禁用该开关
+                if (!IS_DESKTOP) tg.setDisabled(true);
+            })
+            .setDisabled(!IS_DESKTOP);
         new Setting(body)
             .setName('取景框')
             .setDesc('开启后，图片取词命中时在原图上高亮 OCR 取景框，并在右下角浮出送识别的裁剪图（3 秒后自动消失，不遮挡操作）。用于诊断识别不准的问题，默认关闭。移动端不可用（依赖 Windows 系统 OCR），此项已置灰。')
-            .setDisabled(!IS_DESKTOP)
-            .addToggle((tg) => tg.setValue(this.plugin.ocrDebug).onChange(async (v) => {
-                this.plugin.ocrDebug = v;
-                if (!v) this.plugin.hideOcrDebug();
-                await this.plugin.persistLocalSettings();
-            }));
+            .addToggle((tg) => {
+                tg.setValue(this.plugin.ocrDebug).onChange(async (v) => {
+                    this.plugin.ocrDebug = v;
+                    if (!v) this.plugin.hideOcrDebug();
+                    await this.plugin.persistLocalSettings();
+                });
+                // 同上：移动端须在 addToggle 之后显式禁用开关
+                if (!IS_DESKTOP) tg.setDisabled(true);
+            })
+            .setDisabled(!IS_DESKTOP);
         new Setting(body)
             .setName('划词查询')
             .setDesc('选中文本右键「查询」：单词显示词典释义，句子或中文由 AI 翻译并解读。')

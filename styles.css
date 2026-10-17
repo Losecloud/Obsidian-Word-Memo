@@ -12,6 +12,16 @@
     display: none;
 }
 
+/* 移动端（手机）：右侧栏抽屉展开、且其内呈现的是本插件查词视图时，隐藏 Obsidian 底部导航栏
+   （其仍显示「未打开文件」+ 固定/关闭等宿主按钮，压在插件内容下方，属多余宿主 chrome）。
+   作用域严格限定：宿主展开右侧栏时会给 .workspace 加 .is-right-sidedock-open，配合抽屉内
+   本插件视图的 data-type 共同命中——只在此组合状态下隐藏，不波及其它视图；body.is-phone
+   排除桌面端与平板（桌面端右侧栏展开同样会加 .is-right-sidedock-open）。
+   抽屉可用背板点击/侧滑关闭，隐藏底栏不影响退出。 */
+body.is-phone:has(.workspace.is-right-sidedock-open .workspace-leaf-content[data-type="word-memo-dict-view"]) .mobile-navbar {
+    display: none !important;
+}
+
 .word-memo-frame {
     display: block;
     width: 100%;
