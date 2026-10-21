@@ -712,6 +712,21 @@ async function decompressBundle(b64) {
     return new Uint8Array(ab);
 }
 
+// 转成 writeBinary 契约要求的 ArrayBuffer：
+// Obsidian 的 adapter.writeBinary(normalizedPath, data) 入参类型是 ArrayBuffer，移动端桥
+// 按 ArrayBuffer 序列化为原生字节。传 Uint8Array 会被静默写成非二进制内容（写入不抛错，
+// 但回读字节数与预期不符）——iPad 上「write verify failed」即由此而来。
+// 用 slice 只取视图覆盖的那段，避免共享大 buffer 把多余字节一起写进去。
+function toWriteBuffer(content) {
+    if (content instanceof ArrayBuffer) return content;
+    if (ArrayBuffer.isView(content)) {
+        const v = content;
+        if (v.byteOffset === 0 && v.byteLength === v.buffer.byteLength) return v.buffer;
+        return v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+    }
+    return new Uint8Array(content).buffer;
+}
+
 // 写入条目：桌面 fs.writeFileSync；移动端 vault.adapter.writeBinary
 async function writeEntry(target, name, content, adapter) {
     const filePath = target + '/' + name;
@@ -736,7 +751,19 @@ async function writeEntry(target, name, content, adapter) {
             try { await adapter.mkdir(cur); } catch (e) { /* 已存在：忽略；其余错误交给写入阶段暴露 */ }
         }
     }
-    await adapter.writeBinary(filePath, content instanceof Uint8Array ? content : new Uint8Array(content));
+    let written = false;
+    try {
+        await adapter.writeBinary(filePath, toWriteBuffer(content));
+        const diag = {};
+        written = await verifyWrite(adapter, filePath, (content && content.byteLength) || 0, diag);
+    } catch (e) { written = false; }
+    if (written) return;
+    // 二进制写入回读不符（iPad 等环境下 writeBinary 静默写坏）：词典/清单均为文本，
+    // 改用 adapter.write 以 UTF-8 字符串落盘再回读校验一次，避免整条下载链在此中断
+    try {
+        const bytes = ArrayBuffer.isView(content) ? content : new Uint8Array(content);
+        await adapter.write(filePath, new TextDecoder('utf-8').decode(bytes));
+    } catch (e) { /* 交由调用方的 verifyWrite 如实报错 */ }
 }
 
 async function removeEntry(target, name, adapter) {
@@ -754,20 +781,25 @@ async function removeEntry(target, name, adapter) {
 // 确认其存在且字节数与预期一致。部分移动端环境下 adapter.write/writeBinary 会静默失败，
 // 回读能把「假成功」变成显式错误，避免页面以为导入成功、实际文件根本没落盘。
 // 参数 vaultPath 为 vault 相对路径；expectedBytes 为预期字节数（-1 表示只确认可读非空）
-async function verifyWrite(adapter, vaultPath, expectedBytes) {
-    if (!adapter) return false;
-    try {
-        if (typeof adapter.exists === 'function' && !await adapter.exists(vaultPath)) return false;
-        const data = (typeof adapter.readBinary === 'function')
-            ? await adapter.readBinary(vaultPath)
-            : await adapter.read(vaultPath);
-        const bytes = (data && typeof data.byteLength === 'number')
-            ? data.byteLength
-            : new TextEncoder().encode(String(data == null ? '' : data)).length;
-        return expectedBytes < 0 ? true : bytes === expectedBytes;
-    } catch (e) {
-        return false;
+// diag（可选）：回填 { exists, actual }，供失败时把「预期/实际字节数」带进错误信息定位问题
+async function verifyWrite(adapter, vaultPath, expectedBytes, diag) {
+    let exists = false, actual = -1, ok = false;
+    if (adapter) {
+        try {
+            exists = !(typeof adapter.exists === 'function') || await adapter.exists(vaultPath);
+            if (exists) {
+                const data = (typeof adapter.readBinary === 'function')
+                    ? await adapter.readBinary(vaultPath)
+                    : await adapter.read(vaultPath);
+                actual = (data && typeof data.byteLength === 'number')
+                    ? data.byteLength
+                    : new TextEncoder().encode(String(data == null ? '' : data)).length;
+                ok = expectedBytes < 0 ? true : actual === expectedBytes;
+            }
+        } catch (e) { ok = false; }
     }
+    if (diag) { diag.exists = exists; diag.actual = actual; }
+    return ok;
 }
 
 // 迁移旧版用户配置：旧版写在 <vault>/.word-memo/user/ 下（点开头目录，Sync 不会同步）。
@@ -1954,9 +1986,18 @@ module.exports = class WordMemoPlugin extends Plugin {
                 const varName = String((obj && obj.varName) || '');
                 // 与 'fetch-url' 同一白名单：只放行 http(s)，避免被当作任意协议跳板
                 if (!/^https?:\/\//i.test(url)) { reply(false, 400, { ok: false, error: 'invalid url' }); return; }
-                let resp;
-                try { resp = await requestUrl({ url: url }); }
-                catch (e) { reply(false, 500, { ok: false, error: (e && e.message) || String(e) }); return; }
+                let resp = null, lastErr = '';
+                // iPad 上 requestUrl 到 raw.githubusercontent.com 偶发 TLS 握手失败
+                // （「TLS错误导致安全连接失败」），属网络瞬时问题且原链路已验证可通，故自动重试
+                for (let attempt = 1; attempt <= 3 && !resp; attempt++) {
+                    if (attempt > 1) await new Promise(r => setTimeout(r, 1200 * (attempt - 1)));
+                    try { resp = await requestUrl({ url: url }); }
+                    catch (e) { lastErr = (e && e.message) || String(e); resp = null; }
+                }
+                if (!resp) {
+                    reply(false, 500, { ok: false, error: '下载失败（已重试 3 次）：' + lastErr });
+                    return;
+                }
                 // 取字节：requestUrl 已把响应体整体读入内存；优先 arrayBuffer，个别环境缺失时退回文本编码
                 const bytes = (resp && resp.arrayBuffer)
                     ? new Uint8Array(resp.arrayBuffer)
@@ -1971,8 +2012,12 @@ module.exports = class WordMemoPlugin extends Plugin {
                 await writeEntry(APP_DIR, 'data/' + fname, bytes, adapter); // 自动逐级建目录后写入
                 // 写后回读校验：确认字节数一致；失败则如实报错并附实际路径，绝不更新清单
                 // （否则清单会指向一个并不存在的词典文件）
-                if (!await verifyWrite(adapter, dictPath, bytes.length)) {
-                    reply(false, 500, { ok: false, error: 'write verify failed', path: dictPath });
+                const vdiag = {};
+                if (!await verifyWrite(adapter, dictPath, bytes.length, vdiag)) {
+                    reply(false, 500, {
+                        ok: false, error: 'write verify failed', path: dictPath,
+                        exists: vdiag.exists, expected: bytes.length, actual: vdiag.actual
+                    });
                     return;
                 }
                 // 清单内容：.js 传文本供解析变量名，.json 传空串（由文件名约定推导变量名）
