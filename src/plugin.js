@@ -358,15 +358,24 @@ function wordAtPoint(x, y) {
 }
 
 // 悬浮取词的上下文：按叶子视图类型分流，不依赖各版本易变的容器类名。
-// 除笔记正文与 PDF 文本层外，Obsidian 内任意内容面板（第三方视图、Canvas、属性区等）
-// 的 DOM 文本同样可取词；仅排除本插件自身视图与视图抬头（标签标题/前进后退/⋮）
+// 只对「阅读内容」取词：笔记正文 / PDF 文本层 / Canvas 等文档面板；
+// 文件列表、搜索、大纲、反链、标签、属性等侧栏文字属于界面元素，不参与取词。
+// 仍排除本插件自身视图与视图抬头（标签标题/前进后退/⋮）
+const HOVER_SKIP_LEAF_TYPES = new Set([
+    'file-explorer', 'search', 'outline', 'bookmarks', 'backlink', 'tag',
+    'properties', 'all-properties', 'graph', 'localgraph', 'release-notes'
+]);
+
 function hoverContext(el) {
     if (!el || typeof el.closest !== 'function') return null;
     const leaf = el.closest('.workspace-leaf-content');
     if (!leaf) return null;
     const dtype = leaf.getAttribute('data-type');
     if (dtype === VIEW_TYPE || dtype === DICT_VIEW_TYPE || dtype === COVER_VIEW_TYPE) return null;
+    if (HOVER_SKIP_LEAF_TYPES.has(dtype)) return null; // 界面/侧栏面板不取词
     if (el.closest('.view-header')) return null; // 抬头里的文件名/按钮不作为取词对象
+    // 笔记标题（文件名）与属性区键值也是界面元素，不作为取词对象
+    if (el.closest('.inline-title, .metadata-container, .metadata-property')) return null;
     // PDF：内置 PDF 视图，或笔记内嵌的 PDF（此时叶子类型仍是 markdown）
     if (dtype === 'pdf' || el.closest('.pdf-embed, .pdf-viewer, .pdf-container')) return { kind: 'pdf' };
     if (el.closest('.markdown-source-view, .markdown-reading-view')) return { kind: 'note' };
@@ -1577,9 +1586,24 @@ class WordMemoSettingTab extends PluginSettingTab {
                     this.plugin.obSettings.hoverLookup = v;
                     if (!v) this.plugin.cancelHover();
                     await this.plugin.persistLocalSettings();
+                    this.plugin.pushSettingsToAllFrames();
                 });
                 // setDisabled 只作用于「已注册」的组件；若先 setDisabled 再 addToggle，
                 // 开关本身不会被禁用、仍可操作。故在 addToggle 之后显式禁用该开关
+                if (!IS_DESKTOP) tg.setDisabled(true);
+            })
+            .setDisabled(!IS_DESKTOP);
+        // 应用内悬浮取词：独立于上面的「悬浮取词」（后者只管 Obsidian 笔记 / PDF），
+        // 便于关掉笔记取词后仍保留词忆页面内的悬浮查词，或反之
+        new Setting(body)
+            .setName('应用内悬浮取词')
+            .setDesc('仅词忆主页面生效：鼠标在页面文字/配图上停留 0.5 秒即推送到右侧栏查词，与上方「悬浮取词」（Obsidian 笔记 / PDF）各自独立。需同时开启「右侧窗口查词」。关闭后应用内不再触发，不影响笔记与 PDF 取词。移动端不可用（无鼠标悬停），此项已置灰。')
+            .addToggle((tg) => {
+                tg.setValue(this.plugin.obSettings.appHoverLookup !== false).onChange(async (v) => {
+                    this.plugin.obSettings.appHoverLookup = v;
+                    await this.plugin.persistLocalSettings();
+                    this.plugin.pushSettingsToAllFrames();
+                });
                 if (!IS_DESKTOP) tg.setDisabled(true);
             })
             .setDisabled(!IS_DESKTOP);
@@ -1687,7 +1711,7 @@ module.exports = class WordMemoPlugin extends Plugin {
         // answerLookup 默认值按平台区分：手机的右侧栏是覆盖式弹层，作答时弹出来会遮挡题干，
         // 体验明显差于桌面端的自适应布局，故移动端默认「均不显示」（none）；桌面端沿用原默认
         // 「答错显示」。已保存的设置值仍然优先（跨端同步过来的旧值不会被动改写）
-        this.obSettings = { hoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true, answerLookup: IS_DESKTOP ? 'wrong' : 'none', userDir: DEFAULT_USER_DIR };
+        this.obSettings = { hoverLookup: true, appHoverLookup: true, selectionTranslate: true, dictLookupInSidebar: true, answerLookup: IS_DESKTOP ? 'wrong' : 'none', userDir: DEFAULT_USER_DIR };
         this.hoverWord = ''; // 当前悬浮所在单词（同一单词不重复查询、不重置计时）
         this.hoverTimer = null;
         this.hoverTick = 0; // 取词节流时间戳
@@ -2063,6 +2087,7 @@ module.exports = class WordMemoPlugin extends Plugin {
         view.postToFrame({
             type: 'wm-ob-settings',
             hoverLookup: this.obSettings.hoverLookup !== false,
+            appHoverLookup: this.obSettings.appHoverLookup !== false,
             selectionTranslate: this.obSettings.selectionTranslate !== false,
             dictLookupInSidebar: this.obSettings.dictLookupInSidebar !== false,
             answerLookup: this.obSettings.answerLookup || 'wrong'
@@ -2097,14 +2122,18 @@ module.exports = class WordMemoPlugin extends Plugin {
             this.onHoverWord(word);
             return;
         }
-        // 文本层没取到词：可能是图片（含无文本层的扫描页/截图）。
-        // 仅当鼠标移动超过阈值时才再次取景，避免停在原地抖动时反复取景 / 反复 OCR；
+        // 文本层没取到词：说明光标已离开单词。这里先判断光标下是否有可 OCR 图源，
+        // 没有就立刻取消待触发的文本取词计时——否则鼠标只是「划过」单词、停在空白处，
+        // 0.5 秒后仍会推送该词，表现为取词过于灵敏（PDF 文字层尤其明显）
+        const src = this.ocrSourceAtPoint(e.clientX, e.clientY);
+        if (!src) { this.cancelHover(); return; }
+        // 停在图源上：移动超过阈值才再次取景，避免抖动时反复取景 / 反复 OCR；
         // 停顿在空白处不触发，右侧继续保持当前词汇
         const dx = e.clientX - this.hoverX, dy = e.clientY - this.hoverY;
         if (dx * dx + dy * dy < HOVER_MOVE_THRESHOLD * HOVER_MOVE_THRESHOLD) return;
         this.hoverX = e.clientX;
         this.hoverY = e.clientY;
-        this.onHoverImage(e.clientX, e.clientY);
+        this.onHoverImage(e.clientX, e.clientY, src);
     }
 
     // 文本取词：同一单词不重置计时，也不重复查询
@@ -2131,9 +2160,10 @@ module.exports = class WordMemoPlugin extends Plugin {
 
     // —— 图片取词（OCR，Windows 系统能力；失败则静默降级为仅文本取词）——
 
-    // OCR 是否可用：悬浮取词关闭 / 非 Windows / 此前连续失败时直接跳过
-    ocrAvailable() {
-        if (!this.obSettings.hoverLookup || this.ocrState === 'off') return false;
+    // OCR 是否可用：悬浮取词关闭 / 非 Windows / 此前连续失败时直接跳过。
+    // ignoreHover：应用内取词走独立的「应用内悬浮取词」开关，不受笔记取词开关影响
+    ocrAvailable(ignoreHover) {
+        if ((!ignoreHover && !this.obSettings.hoverLookup) || this.ocrState === 'off') return false;
         // 移动端无 execFile / process 不稳；非桌面端或非 Windows 一律关闭，避免抛错
         if (!IS_DESKTOP || !execFile || typeof process === 'undefined' || process.platform !== 'win32') {
             this.ocrState = 'off';
@@ -2214,9 +2244,9 @@ module.exports = class WordMemoPlugin extends Plugin {
     }
 
     // 图片取词入口：光标映射到图源像素坐标 → 取景框 → 进入 0.5s 计时
-    onHoverImage(x, y) {
+    onHoverImage(x, y, src) {
         if (!this.ocrAvailable()) { this.cancelHover(); return; }
-        const src = this.ocrSourceAtPoint(x, y);
+        src = src || this.ocrSourceAtPoint(x, y);
         if (!src) { this.cancelHover(); return; }
         const rect = src.el.getBoundingClientRect();
         if (!rect.width || !rect.height) { this.cancelHover(); return; }
@@ -2309,7 +2339,7 @@ module.exports = class WordMemoPlugin extends Plugin {
     // 这里解码为 Image 后复用同一套取景（segmentImageWord）与系统 OCR（ocrCrop），
     // 命中则把单词交右侧栏查词视图承接（keepFocus，不抢走应用内焦点）
     async ocrFromApp(dataUrl, ix, iy) {
-        if (!this.ocrAvailable()) return;
+        if (!this.ocrAvailable(true)) return;
         if (this.ocrBusy) { this.ocrPendingApp = { dataUrl, ix, iy }; return; } // 忙：暂存最后一次
         this.ocrBusy = true;
         this.ocrPendingApp = null;
